@@ -462,7 +462,7 @@ class Trainer:
         # Update Model
         self.model._opacity = optimizable_tensors["opacity"]
         
-        print(f"Opacity Reset Done.")
+        # print(f"Opacity Reset Done.")
 
     
     def _compute_scene_extent(self) -> float:

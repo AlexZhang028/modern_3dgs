@@ -5,11 +5,11 @@ data:
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: output\bar-release
+  model_path: /mnt/hdd/freetime/bar-release
   num_workers: 4
   pin_memory: true
   resolution: 8
-  source_path: ..\3DGS_test_data\bar-release
+  source_path: /mnt/hdd/selfcap/bar-release
   start_frame: 3190
   test_cameras:
   - '10'

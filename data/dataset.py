@@ -660,7 +660,9 @@ class SelfCapVideoDataset(GaussianDataset):
                     continue
 
             extr = extrinsics[name]
-            R = extr['R']
+            # Stores World-to-Camera matrix (OpenCV)
+            # Camera class expects Camera-to-World rotation (equivalent to Transposed W2C)
+            R = extr['R'].transpose()
             T = extr['T']
             
             intr = intrinsics.get(name)

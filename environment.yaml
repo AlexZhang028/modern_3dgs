@@ -21,6 +21,6 @@ dependencies:
     - tensorboard
     - scipy
     - pillow
-    - diff-gaussian-rasterization  # Requires submodule
-    - simple-knn                   # Requires submodule
+    # - diff-gaussian-rasterization  # Requires submodule
+    # - simple-knn                   # Requires submodule
 
