@@ -1,0 +1,167 @@
+# 默认训练配置文件
+# 对应 config/config.py 中的 TrainingConfig
+
+# ============================================================================
+# 数据配置 (DataConfig)
+# ============================================================================
+data:
+  source_path: ""  # 数据集根目录（必填）
+  model_path: "output"  # 模型保存路径
+  images: "images"
+  depths: ""  # 深度图文件夹（可选）
+  resolution: -1  # -1 表示使用原始分辨率
+  white_background: false
+  
+  # 初始点云配置
+  init_point_cloud_path: ""  # 自定义初始点云路径（可选），留空则自动搜索或生成
+  
+  # 高级数据加载选项
+  data_device: "cuda"
+  eval: false
+  train_test_exp: false
+  cache_images: false
+  num_workers: 8
+  pin_memory: true
+  lazy_loading: true 
+
+# ============================================================================
+# 模型配置 (ModelConfig)
+# ============================================================================
+model:
+  sh_degree: 3  # 球谐函数阶数
+  mode: "static"  # "static" (原版3DGS) 或 "freetime" (FreeTimeGS)
+  percent_dense: 0.01
+  
+  # FreeTimeGS 特有参数
+  time_dim: 0
+  motion_dim: 0
+
+# ============================================================================
+# 优化器配置 (OptimConfig)
+# ============================================================================
+optim:
+  iterations: 30000
+  
+  # 学习率设置
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 30000
+  
+  feature_lr: 0.0025
+  opacity_lr: 0.025
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  
+  # FreeTimeGS 学习率
+  t_lr: 0.001
+  t_scale_lr: 0.001
+  velocity_lr: 0.001
+  
+  # 曝光补偿学习率
+  exposure_lr_init: 0.01
+  exposure_lr_final: 0.001
+  exposure_lr_delay_steps: 0
+  exposure_lr_delay_mult: 0.0
+  
+  # 优化器参数
+  betas: [0.9, 0.999]
+  eps: 1.0e-15
+  optimizer_type: "default"
+  
+  # 损失权重
+  lambda_dssim: 0.2
+  depth_l1_weight_init: 1.0
+  depth_l1_weight_final: 0.01
+  
+  # 背景
+  random_background: false
+  
+  # 兼容性参数（优先使用 densify 节）
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densify_grad_threshold: 0.0002
+
+# ============================================================================
+# Densification 配置 (DensificationConfig)
+# ============================================================================
+densify:
+  # Densification 时机
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densify_interval: 100
+  
+  # 阈值
+  densify_grad_threshold: 0.0002
+  percent_dense: 0.01
+  N_split: 2
+  
+  # Pruning
+  prune_from_iter: 3000
+  prune_interval: 100
+  prune_max_screen_size_iter: 3000
+  prune_opacity_threshold: 0.005
+  prune_size_threshold: 20.0
+  
+  # Opacity Reset
+  opacity_reset_interval: 3000
+  
+  cameras_extent: 1.0
+
+# ============================================================================
+# 渲染管道配置 (PipelineConfig)
+# ============================================================================
+pipeline:
+  compute_cov3D_python: false
+  convert_SHs_python: false
+  debug: false
+  antialiasing: false
+
+# ============================================================================
+# 训练环境配置 (TrainerConfig)
+# ============================================================================
+trainer:
+  iterations: 30000
+  
+  # 间隔设置
+  save_interval: -1
+  test_interval: -1
+  log_interval: 10
+  sh_degree_interval: 1000
+  
+  # 输出设置
+  output_dir: "output"
+  checkpoint_dir: "checkpoints"
+  keep_checkpoints: 3
+  save_ply: true
+  save_checkpoint: false
+  
+  # 日志
+  enable_tensorboard: true
+  log_dir: "logs"
+  num_test_views: 5
+  
+  # 训练环境参数
+  random_background: false
+  white_background: false
+  
+  # Densification 参数副本 (用于 Trainer 流程控制)
+  densify_grad_threshold: 0.0002
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densify_interval: 100
+  opacity_reset_interval: 3000
+  prune_opacity_threshold: 0.005
+  prune_size_threshold: 20.0
+  
+  lambda_dssim: 0.2
+
+# ============================================================================
+# 全局设置 (TrainingConfig 顶层字段)
+# ============================================================================
+seed: 42
+use_tensorboard: true
+log_interval: 10
+save_iterations: [7000, 30000]
+checkpoint_iterations: [7000, 30000]
+test_iterations: [7000, 30000]

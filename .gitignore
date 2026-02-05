@@ -1,0 +1,27 @@
+# Custom exclusions
+output/
+debug/
+
+# Data and artifacts
+*.ply
+*.log
+*.pt
+*.pth
+*.png
+*.pdf
+*.ipynb
+
+# Python standard
+__pycache__/
+*.py[cod]
+*$py.class
+
+# VS Code
+.vscode/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
