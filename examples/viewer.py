@@ -184,7 +184,9 @@ class ObitControl:
         forward /= np.linalg.norm(forward)
         
         # World Up = Y
-        world_up = np.array([0, 1.0, 0])
+        # world_up = np.array([0, 1.0, 0])
+        # For SelfCap data, Y is downwards, so we flip the world up to -Y
+        world_up = np.array([0, -1.0, 0])
         
         # Right (X_cam)
         right = np.cross(forward, world_up)
@@ -374,7 +376,7 @@ def render_preview_dynamic(
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     
     with torch.no_grad():
-        out = renderer(gaussians, camera, bg_color, timestamp=time_val)
+        out = renderer(gaussians, camera, bg_color, timestamp=time_val, enable_culling=False) # Disable culling to get accurate visibility stats for dynamic models
     
     torch.cuda.synchronize()
     render_time_ms = (time.time() - start_time) * 1000

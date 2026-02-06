@@ -546,22 +546,33 @@ class FreeTimeGaussianModel(GaussianModel):
         t_scale = get_tensor('t_scale').detach().cpu().numpy()
         motion = get_tensor('motion').detach().cpu().numpy()
         
-        # Un-normalize for saving (0-1 -> Seconds)
-        t_extent = self.t_extent.item()
-        t_start = self.t_start.item()
-        
-        # t_sec = t_norm * t_extent + t_start
-        vertex_data['t'] = t[:, 0] * t_extent + t_start
-        
-        # t_scale (duration): scale * t_extent
-        # log(scale * t_extent) = log(scale) + log(t_extent)
-        # Assuming params are log-scale, we add log(t_extent)
-        vertex_data['t_scale'] = t_scale[:, 0] + np.log(t_extent)
-        
-        # Motion: v_sec = v_norm / t_extent
-        vertex_data['motion_0'] = motion[:, 0] / t_extent
-        vertex_data['motion_1'] = motion[:, 1] / t_extent
-        vertex_data['motion_2'] = motion[:, 2] / t_extent
+        # Check normalized mode
+        normalized_t_mode = getattr(self.config, 'normalized_t', True)
+
+        if normalized_t_mode:
+            # Un-normalize for saving (0-1 -> Seconds)
+            t_extent = self.t_extent.item()
+            t_start = self.t_start.item()
+            
+            # t_sec = t_norm * t_extent + t_start
+            vertex_data['t'] = t[:, 0] * t_extent + t_start
+            
+            # t_scale (duration): scale * t_extent
+            # log(scale * t_extent) = log(scale) + log(t_extent)
+            # Assuming params are log-scale, we add log(t_extent)
+            vertex_data['t_scale'] = t_scale[:, 0] + np.log(t_extent)
+            
+            # Motion: v_sec = v_norm / t_extent
+            vertex_data['motion_0'] = motion[:, 0] / t_extent
+            vertex_data['motion_1'] = motion[:, 1] / t_extent
+            vertex_data['motion_2'] = motion[:, 2] / t_extent
+        else:
+            # Save raw values (already in Seconds)
+            vertex_data['t'] = t[:, 0]
+            vertex_data['t_scale'] = t_scale[:, 0]
+            vertex_data['motion_0'] = motion[:, 0]
+            vertex_data['motion_1'] = motion[:, 1]
+            vertex_data['motion_2'] = motion[:, 2]
 
     def get_param_groups(self, optim_config) -> List[Dict]:
         groups = super().get_param_groups(optim_config)
@@ -665,13 +676,10 @@ class FreeTimeGaussianModel(GaussianModel):
         new_opacity = inverse_sigmoid(0.1 * torch.ones(mask.sum(), 1, device=self.device))
         self._opacity[mask] = new_opacity
         
-        # 5. Reset Duration -> default (e.g. log(1.0) = 0, or something smaller?)
-        # Standard init is -5.0 (very short) or log(1.0)? 
-        # process_selfcap_pcd.py uses -5.0. 
-        # Model init in create_from_pcd uses log(1.0)=0.
-        # Let's use 0.0 (duration=1.0) to give it a chance to be seen? 
-        # Or -2.0 ? Let's stick to 0.0 (wide window) so it doesn't vanish immediately.
-        self._t_scale[mask] = 0.0 
+        # 5. Reset Duration -> random small duration, rand*2 -> [0,2]. -3 -> [-3, -1]. Correct.
+        n_relocated = mask.sum()
+        random_scales = (torch.rand(n_relocated, 1, device="cuda") * 2.0) - 3.0 
+        self._t_scale[mask] = random_scales
 
 
 def detect_mode_from_ply(ply_path: str) -> str:

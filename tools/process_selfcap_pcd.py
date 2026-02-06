@@ -276,7 +276,7 @@ def main():
         # Duration init (log scale)
         # Fix from FreeTimeGS_fix.md: Initialize with log(1.0) or log(0.5)
         # Using 0.0 to let it cover more time initially and then shrink via regularization
-        final_t_scale.append(np.full((len(curr_pts_filtered), 1), 10.0))
+        final_t_scale.append(np.full((len(curr_pts_filtered), 1), -2))
         
         static_count = len(static_indices)
         dropped_count = static_count - np.sum(keep_mask[static_indices])

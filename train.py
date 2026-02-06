@@ -16,8 +16,19 @@ Usage:
 
 import sys
 import torch
-from pathlib import Path
 import traceback
+
+# Fix for "Bus Error" / "No space left on device" in shared memory
+# Switches tensor sharing strategy from /dev/shm to filesystem
+try:
+    # Check if we should enforce file_system strategy
+    # Some environments have ample /dev/shm but file_system is safer for large datasets
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy('file_system')
+except RuntimeError:
+    pass
+
+from pathlib import Path
 
 from config.parser import parse_args, get_combined_configs, save_config
 from core.builder import setup_dataset, setup_model, setup_optimizer, setup_renderer

@@ -18,7 +18,7 @@ data:
   data_device: "cuda"
   eval: false
   cache_images: false # 显存优化：如果不缓存图像，每次迭代从 CPU 读取
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
   lazy_loading: true # 推荐开启，避免一次性加载所有视频帧
 
@@ -46,7 +46,7 @@ optim:
   
   # FreeTimeGS 专用参数 (参照文档 implementation details)
   t_lr: 0.0001        # Time Center (mu_t)
-  t_scale_lr: 0.005   # Duration (s) - 与 scaling_lr 一致
+  t_scale_lr: 0.0005   # Duration (s) - 与 scaling_lr 一致
   velocity_lr: 0.00016 # Velocity (v) - 与 position_lr 一致
   
   # 损失权重

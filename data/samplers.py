@@ -93,6 +93,9 @@ class TemporalSampler(DataSampler):
                 persistent_workers=True
             )
             self.loader_iter = iter(self.loader)
+        else:
+            print("TemporalSampler: Main thread data loading (0 workers).")
+            self.viewpoint_stack = []
     
     def sample(self) -> Tuple[Any, float]:
         """Randomly sample camera and timestamp."""
@@ -105,7 +108,11 @@ class TemporalSampler(DataSampler):
             
             camera = sample["camera"]
         else:
-            idx = torch.randint(0, self.num_cameras, (1,)).item()
+            # Refill stack if empty
+            if not self.viewpoint_stack:
+                self.viewpoint_stack = torch.randperm(self.num_cameras).tolist()
+            
+            idx = self.viewpoint_stack.pop()
             sample = self.dataset[idx]
             camera = sample["camera"]
 

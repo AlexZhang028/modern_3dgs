@@ -253,7 +253,8 @@ class GaussianDensifier:
         
         self._prune_points(prune_mask)
         return prune_mask.sum().item()
-    
+
+
     def densify_and_prune(
         self,
         iteration: int,

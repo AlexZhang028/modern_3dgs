@@ -30,9 +30,9 @@ def parse_args():
                         choices=["static", "freetime"], help="Model type")
     
     # Training Arguments
-    parser.add_argument("--iterations", type=int, default=30000, help="Training iterations")
-    parser.add_argument("--sh_degree", type=int, default=3, help="SH degree")
-    parser.add_argument("--resolution", type=int, default=-1, help="Image resolution (-1 for original)")
+    parser.add_argument("--iterations", type=int, default=None, help="Training iterations")
+    parser.add_argument("--sh_degree", type=int, default=None, help="SH degree")
+    parser.add_argument("--resolution", type=int, default=None, help="Image resolution (-1 for original)")
     
     # Optional Arguments
     parser.add_argument("--white_background", action="store_true", help="Use white background")
@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--train_views", nargs='+', type=str, default=None, help="Specific cameras for training (overrides config)")
     parser.add_argument("--test_views", nargs='+', type=str, default=None, help="Specific cameras for testing (overrides config)")
     parser.add_argument("--normalized_t", type=int, default=None, help="Use normalized time (0/1) or seconds. 1=True, 0=False")
+    parser.add_argument("--fps", type=float, default=None, help="Override video FPS")
     
     # Debug Arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -78,11 +79,11 @@ def merge_configs(yaml_config: dict, args: argparse.Namespace) -> dict:
         config['data']['model_path'] = args.model_path
     if args.model_type:
         config['model']['mode'] = args.model_type
-    if args.iterations:
+    if args.iterations is not None:
         config['optim']['iterations'] = args.iterations
-    if args.sh_degree:
+    if args.sh_degree is not None:
         config['model']['sh_degree'] = args.sh_degree
-    if args.resolution != -1:
+    if args.resolution is not None:
         config['data']['resolution'] = args.resolution
     if args.white_background:
         config['data']['white_background'] = True
@@ -105,6 +106,10 @@ def merge_configs(yaml_config: dict, args: argparse.Namespace) -> dict:
         if 'data' not in config: config['data'] = {}
         config['model']['normalized_t'] = val
         config['data']['normalized_t'] = val
+        
+    if args.fps is not None:
+        if 'data' not in config: config['data'] = {}
+        config['data']['fps'] = args.fps
         
     # View Selection Overrides
     if args.train_views:

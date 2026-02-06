@@ -6,7 +6,7 @@ data:
   init_point_cloud_path: ''
   lazy_loading: true
   model_path: /mnt/hdd/freetime/bar-release
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
   resolution: 8
   source_path: /mnt/hdd/selfcap/bar-release

@@ -55,6 +55,10 @@ def setup_dataset(data_config: DataConfig, split: str = "train") -> Optional[Gau
             train_camera_names=data_config.train_cameras,
             normalized_t=data_config.normalized_t,
         )
+        
+        # Inject fps override if available
+        if hasattr(data_config, 'fps') and data_config.fps > 0:
+            dataset.fps = data_config.fps
     except Exception as e:
         print(f"   Failed to load {split} dataset: {e}")
         return None
@@ -81,6 +85,7 @@ def setup_model(
         sh_degree=model_config.sh_degree,
         time_dim=model_config.time_dim if model_config.mode == "freetime" else 0,
         motion_dim=model_config.motion_dim if model_config.mode == "freetime" else 0,
+        normalized_t=model_config.normalized_t,
     )
     
     # Create model

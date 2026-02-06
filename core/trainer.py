@@ -256,7 +256,8 @@ class Trainer:
             gaussians=self.model,
             camera=camera,
             bg_color=bg_color,
-            timestamp=timestamp
+            timestamp=timestamp,
+            enable_culling=False  # Disable culling for stable training and proper densification stats
         )
         
         # 6. Compute Loss
@@ -383,7 +384,7 @@ class Trainer:
                     )
                 
                 # Relocation Hook
-                self._post_backward_hook(iteration, rendered, target, camera)
+                self._post_backward_hook(iteration, rendered, target, camera, timestamp)
 
                 # Standard Densify and Prune
                 if iteration > self.config.densify_from_iter and iteration % self.config.densify_interval == 0:
@@ -430,7 +431,7 @@ class Trainer:
         """Hook for additional loss computation."""
         return loss
 
-    def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any):
+    def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
         """Hook for post-backward operations (e.g. relocation)."""
         pass
 
@@ -494,6 +495,8 @@ class Trainer:
                 self.writer.add_scalar('Stats/iteration_time', metrics['iteration_time'], iteration)
             self.writer.add_scalar('Stats/num_gaussians', metrics['num_gaussians'], iteration)
             self.writer.add_scalar('Stats/sh_degree', self.current_sh_degree, iteration)
+            self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
+            self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
         
         # History
         self.stats['loss_history'].append(metrics['loss'])
@@ -534,7 +537,8 @@ class Trainer:
                     gaussians=self.model,
                     camera=camera,
                     bg_color=self.bg_color,
-                    timestamp=None  # Use default time for testing
+                    timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
+                    enable_culling=False
                 )
                 
                 prediction = rendered['render']
@@ -686,13 +690,13 @@ class FreeTimeTrainer(Trainer):
             
         return loss
 
-    def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any):
+    def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
         # Periodic Relocation
         if iteration > self.config.densify_from_iter and \
            iteration % self.config.relocation_interval == 0:
-            self._relocate_gaussians(iteration, rendered, target, camera)
+            self._relocate_gaussians(iteration, rendered, target, camera, timestamp)
 
-    def _relocate_gaussians(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any):
+    def _relocate_gaussians(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
         """
         FreeTimeGS Relocation Strategy:
         Teleport "dead" gaussians (donors) to high-score regions (receptors).
@@ -700,31 +704,41 @@ class FreeTimeTrainer(Trainer):
         """
         # 1. Identify "Donors" (Low Base Opacity)
         # Using 0.01 threshold as per paper
-        prune_mask = (self.model.get_opacity < 0.01).squeeze()
+        # And ensure we don't prune everything
+        opac = self.model.get_opacity.squeeze()
+        prune_mask = (opac < 0.01) & (opac >= 0.005) # Only recycle standard victims
+        # If we just pick < 0.01, standard pruning (0.005) might have killed them? 
+        # But this runs usually before pruning or around same time.
+        
         num_prune = prune_mask.sum().item()
         
         if num_prune == 0:
             return
 
         # 2. Identify "Receptors" (High Sampling Score)
-        # s = lambda_g * grad + lambda_o * sigma
-        if self.model.denom.sum() == 0: # Safety check
+        # Use Densifier's stats! Model's buffers are often empty if not updated.
+        if self.densifier.denom.sum() == 0: # Safety check
              return
 
-        avg_grads = self.model.xyz_gradient_accum / torch.clamp(self.model.denom, min=1e-6)
-        avg_grads = avg_grads.squeeze()
+        # Calculate average gradients
+        # Note: densifier uses self.xyz_gradient_accum
+        grads = self.densifier.xyz_gradient_accum / torch.clamp(self.densifier.denom, min=1e-6)
+        grads[grads.isnan()] = 0.0
+        grad_norm = torch.norm(grads, dim=-1)
         
-        # Normalize? Paper doesn't say. Assuming raw values.
-        # But grad is usually small, opacity is 0..1.
-        # lambda_g = 0.5, lambda_o = 0.5
+        # Normalize to combine with opacity
+        g_max = grad_norm.max()
+        if g_max > 0: grad_norm /= g_max
         
-        score = 0.5 * avg_grads + 0.5 * self.model.get_opacity.squeeze()
+        score = 0.5 * grad_norm + 0.5 * opac
+        
+        # Mask out donors so we don't relocate to dead zones
+        score[prune_mask] = -1.0
         
         # Select Top-K receptors
-        # We need num_prune locations
-        # If num_prune > num_points, cap it? (Unlikely unless huge pruning)
-        n_receptors = min(num_prune, self.model.num_points)
-        
+        n_receptors = min(num_prune, (~prune_mask).sum().item())
+        if n_receptors == 0: return
+
         top_scores, receptor_indices = torch.topk(score, n_receptors)
         
         # 3. Relocate
@@ -732,25 +746,36 @@ class FreeTimeTrainer(Trainer):
         receptor_pos = self.model.get_xyz[receptor_indices]
         receptor_scales = self.model.get_scaling[receptor_indices]
         
-        # Random perturbation within receptor scale
-        noise = torch.randn_like(receptor_pos) * receptor_scales
+        # Random perturbation within receptor scale (or small constant)
+        # Using small constant is safer for stability
+        noise = (torch.rand_like(receptor_pos) - 0.5) * 0.01 # +/- 0.005 range
         new_xyz = receptor_pos + noise
         
-        # Get timestamp
+        # Apply strict mask limit if n_receptors < num_prune
+        active_indices = torch.nonzero(prune_mask).squeeze()
+        if active_indices.ndim == 0 and num_prune>0: active_indices=active_indices.unsqueeze(0)
+        target_indices = active_indices[:n_receptors]
         
-        if 'temporal_info' in rendered:
-            timestamp = rendered['temporal_info']['timestamp']
-        elif hasattr(camera, 'timestamp'):
-            timestamp = camera.timestamp
-        else:
-            timestamp = 0.5  # Default mid-time
+        final_mask = torch.zeros_like(prune_mask)
+        final_mask[target_indices] = True
 
-        # Apply Relocation
-        self.model.relocate(prune_mask, new_xyz, timestamp)
+        # Apply Relocation (XYZ + Time)
+        self.model.relocate(final_mask, new_xyz, timestamp)
+        
+        # Reset Opacity to 0.01
+        new_opacity = utils.inverse_sigmoid(torch.ones(n_receptors, device="cuda") * 0.01)
+        with torch.no_grad():
+            self.model._opacity[final_mask] = new_opacity.unsqueeze(1)
         
         # Reset optimizer state for relocated points
         # Essential to prevent momentum from moving them back or erratically
-        self.optimizer.reset_optimizer_state(prune_mask)
+        self.optimizer.reset_optimizer_state(final_mask)
         
-        print(f"[Relocation] Relocated {num_prune} gaussians at iter {iteration}")
+        # print(f"[Relocation] Relocated {n_receptors} gaussians at iter {iteration}")
+
+    def _log_metrics(self, iteration: int, metrics: Dict[str, float]):
+        super()._log_metrics(iteration, metrics)
+        if self.writer:
+            self.writer.add_histogram('params/t_scale_log', self.model._t_scale, iteration)
+
 

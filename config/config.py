@@ -45,6 +45,7 @@ class DataConfig:
     end_frame: int = -1  # Frame end index (-1 = all)
     test_cameras: List[str] = field(default_factory=list)  # List of camera names to use for testing
     train_cameras: List[str] = field(default_factory=list)  # List of camera names to use for training
+    fps: float = -1.0 # Override FPS for video datasets (-1 = auto)
 
 
 

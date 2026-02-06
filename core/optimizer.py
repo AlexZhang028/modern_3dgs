@@ -65,7 +65,7 @@ class GaussianOptimizer:
         # Initial: 1.6e-4, Final: 1.6e-6 (factor 0.01)
         # Scaled by spatial_lr_scale as it is a motion (spatial) parameter
         vel_lr_init = config.velocity_lr * model.spatial_lr_scale
-        vel_lr_final = (config.velocity_lr * 0.01) * model.spatial_lr_scale
+        vel_lr_final = (config.velocity_lr * 0.1) * model.spatial_lr_scale
         
         self.velocity_scheduler = get_velocity_scheduler(
             initial_lr=vel_lr_init,
@@ -75,6 +75,33 @@ class GaussianOptimizer:
         print(f"GaussianOptimizer Initialized")
         print(f"   Param Groups: {len(self.param_groups)}")
         print(f"   Initial Pos LR: {config.position_lr_init * model.spatial_lr_scale:.6f}")
+
+    def reset_optimizer_state(self, mask: torch.Tensor):
+        """
+        Reset Adam optimizer state (momentum) for specific Gaussian indices.
+        Used after relocation or pruning.
+        
+        Args:
+            mask: Boolean mask of Gaussians to reset [N]
+        """
+        for group in self.optimizer.param_groups:
+            # Assumes the first parameter in the group is the one determining the size (N)
+            # Typically group['params'] is a list of Tensors.
+            # In GaussianModel, params are often [N, 1] or [N, 3] etc.
+            if len(group["params"]) == 0:
+                continue
+                
+            param = group["params"][0]
+            if param.shape[0] != mask.shape[0]:
+                continue
+                
+            state = self.optimizer.state.get(param, None)
+            if state is not None:
+                # Zero out momentum (exp_avg) and variance (exp_avg_sq)
+                if "exp_avg" in state:
+                    state["exp_avg"][mask] = 0.0
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"][mask] = 0.0
     
     def _create_param_groups(self) -> List[Dict]:
         """Create parameter groups (different LR for each parameter)."""

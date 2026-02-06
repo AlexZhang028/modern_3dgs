@@ -20,7 +20,7 @@ data:
   eval: false
   train_test_exp: false
   cache_images: false
-  num_workers: 8
+  num_workers: 0 # Disable multi-processing data loading to avoid shared memory issues
   pin_memory: true
   lazy_loading: true 
 

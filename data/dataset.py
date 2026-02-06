@@ -80,6 +80,7 @@ class GaussianDataset(Dataset):
         self.test_camera_names = test_camera_names if test_camera_names is not None else []
         self.train_camera_names = train_camera_names if train_camera_names is not None else []
         self.normalized_t = normalized_t
+        self.fps = -1.0 
 
         # Store camera info
         self.cameras: List[Camera] = []
@@ -615,10 +616,14 @@ class SelfCapVideoDataset(GaussianDataset):
         cap = cv2.VideoCapture(first_video)
         
         # Read FPS and Frames
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0: 
-            print("Warning: Could not read FPS, defaulting to 30.0")
-            fps = 30.0
+        if self.fps > 0:
+            fps = self.fps
+            print(f"Using Manual FPS Override: {fps}")
+        else:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0: 
+                print("Warning: Could not read FPS, defaulting to 30.0")
+                fps = 30.0
             
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
