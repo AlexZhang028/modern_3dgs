@@ -243,6 +243,9 @@ class Trainer:
         
         # Ensure camera data is on GPU (safe for multiprocessing)
         # This handles both images and transformation matrices
+        # IMPORTANT: Use copy to avoid modifying persistent dataset objects when using 0 workers
+        import copy
+        camera = copy.copy(camera)
         camera.to("cuda")
         
         # 4. Random Background (Optional)
@@ -751,6 +754,12 @@ class FreeTimeTrainer(Trainer):
         noise = (torch.rand_like(receptor_pos) - 0.5) * 0.01 # +/- 0.005 range
         new_xyz = receptor_pos + noise
         
+        # Get receptor velocity for inheritance
+        receptor_motion = self.model.get_motion[receptor_indices]
+        # Add small velocity perturbation (e.g. 10% of velocity magnitude or fixed small value)
+        motion_noise = (torch.rand_like(receptor_motion) - 0.5) * 0.2 * torch.norm(receptor_motion, dim=1, keepdim=True).clamp(min=1e-3)
+        new_motion = receptor_motion + motion_noise
+        
         # Apply strict mask limit if n_receptors < num_prune
         active_indices = torch.nonzero(prune_mask).squeeze()
         if active_indices.ndim == 0 and num_prune>0: active_indices=active_indices.unsqueeze(0)
@@ -759,8 +768,8 @@ class FreeTimeTrainer(Trainer):
         final_mask = torch.zeros_like(prune_mask)
         final_mask[target_indices] = True
 
-        # Apply Relocation (XYZ + Time)
-        self.model.relocate(final_mask, new_xyz, timestamp)
+        # Apply Relocation (XYZ + Time + Motion)
+        self.model.relocate(final_mask, new_xyz, timestamp, new_motion)
         
         # Reset Opacity to 0.01
         new_opacity = utils.inverse_sigmoid(torch.ones(n_receptors, device="cuda") * 0.01)

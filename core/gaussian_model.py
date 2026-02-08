@@ -633,7 +633,7 @@ class FreeTimeGaussianModel(GaussianModel):
             'mask': mask
         }
 
-    def relocate(self, mask: torch.Tensor, new_xyz: torch.Tensor, timestamp: float):
+    def relocate(self, mask: torch.Tensor, new_xyz: torch.Tensor, timestamp: float, new_motion: Optional[torch.Tensor] = None):
         """
         Relocate masked gaussians to new positions and reset their temporal attributes.
         Used for periodic relocation in FreeTimeGS.
@@ -642,6 +642,7 @@ class FreeTimeGaussianModel(GaussianModel):
            mask: Boolean mask of gaussians to relocate [N]
            new_xyz: New 3D positions for these gaussians [M, 3] where M = mask.sum()
            timestamp: Current time to set as new mu_t
+           new_motion: New velocity for these gaussians [M, 3]. If None, resets to 0.
         """
         if mask.sum() == 0:
             return
@@ -668,8 +669,12 @@ class FreeTimeGaussianModel(GaussianModel):
         # 2. Reset Time (mu_t) -> Current Time
         self._t[mask] = timestamp
         
-        # 3. Reset Motion -> 0 or small random
-        self._motion[mask] = 0.0
+        # 3. Reset Motion -> Inherited velocity or 0
+        if new_motion is not None:
+             self._motion[mask] = new_motion.to(self.device)
+        else:
+             self._motion[mask] = 0.0
+
         
         # 4. Reset Opacity -> slightly increased to survive execution
         # inverse_sigmoid(0.5) is 0.0. inverse_sigmoid(0.1) is -2.19

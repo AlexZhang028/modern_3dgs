@@ -7,6 +7,7 @@ Supports COLMAP, NeRF Synthetic (Blender), and SelfCap/EasyVolcap dataset format
 import os
 import sys
 import json
+import shutil
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -44,6 +45,7 @@ class GaussianDataset(Dataset):
         test_camera_names: Optional[List[str]] = None,
         train_camera_names: Optional[List[str]] = None,
         normalized_t: bool = True,
+        use_tmp: bool = False,
     ):
         """
         Args:
@@ -63,6 +65,7 @@ class GaussianDataset(Dataset):
             test_camera_names: List of camera names to exclude from training (used as test set)
             train_camera_names: List of camera names to use for training (overrides default split)
             normalized_t: Whether to use normalized time [0,1] or seconds.
+            use_tmp: Use temporary directory for extracted frames.
         """
         self.source_path = source_path
         self.split = split
@@ -81,10 +84,12 @@ class GaussianDataset(Dataset):
         self.train_camera_names = train_camera_names if train_camera_names is not None else []
         self.normalized_t = normalized_t
         self.fps = -1.0 
+        self.use_tmp = use_tmp
 
         # Store camera info
         self.cameras: List[Camera] = []
         self.image_cache: Dict[int, torch.Tensor] = {}
+
         
         # Scene info
         self.scene_info: Dict = {}
@@ -736,13 +741,102 @@ class SelfCapVideoDataset(GaussianDataset):
         print(f"Loaded {len(self.cameras)} frames from SelfCap Video dataset")
         
         # Preload Video Frames optimization
-        # If cache_images is True, we sequentially read the video now to avoid Open+Seek overhead later.
-        # This transforms random access (slow) into sequential access (fast).
-        if self.cache_device:
-            print("Preloading video frames into memory (Sequential Read Optimization)...")
-            self._preload_video_frames()
+        if self.use_tmp:
+            self._extract_frames_to_tmp()
+        else:
+            # Always preload for video datasets to avoid random seek I/O bottleneck
+            target_device = self.cache_device if self.cache_device else "cpu"
+            print(f"Preloading video frames into memory ({target_device}) (Sequential Read Optimization)...")
+            self._preload_video_frames(target_device)
+            
+    def _extract_frames_to_tmp(self):
+        """Extract frames to temporary directory to avoid Random Seek I/O and RAM usage."""
+        tmp_dir = os.path.join(self.source_path, f"tmp_frames_{self.split}")
+        # Ensure fresh start
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir, exist_ok=True)
+        self.tmp_dir = tmp_dir
+        
+        print(f"Extracting frames to temporary directory: {tmp_dir}")
+        print("Note: Ideally this should go to SSD. HDD extraction might be slow but training will be fast.")
+        
+        # Group cameras by video file
+        video_groups = {}
+        for cam in self.cameras:
+            if hasattr(cam, '_video_path'):
+                if cam._video_path not in video_groups:
+                    video_groups[cam._video_path] = []
+                video_groups[cam._video_path].append(cam)
+        
+        from tqdm import tqdm
+        
+        for video_path, cams in video_groups.items():
+            # Sort by frame index
+            cams.sort(key=lambda c: c._frame_idx)
+            
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"Warning: Could not open {video_path}")
+                continue
 
-    def _preload_video_frames(self):
+            max_frame = cams[-1]._frame_idx
+            
+            # Map frame_idx -> list of cams (for efficiency)
+            frame_to_cams = {}
+            for c in cams:
+                if c._frame_idx not in frame_to_cams: frame_to_cams[c._frame_idx] = []
+                frame_to_cams[c._frame_idx].append(c)
+                
+            pbar = tqdm(total=max_frame+1, desc=f"Extracting {os.path.basename(video_path)}", leave=False)
+            current_frame = 0
+            extracted_count = 0
+            
+            while current_frame <= max_frame:
+                if current_frame in frame_to_cams:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    
+                    # We extract FULL resolution to maintain consistency with _load_camera_image logic
+                    # which applies downscaling based on self.resolution.
+                    # Using JPEG for speed and space efficiency (Quality 95 defaults usually fine)
+                    
+                    target_cams = frame_to_cams[current_frame]
+                    img_name = target_cams[0].image_name
+                    file_name = f"{img_name}.jpg" 
+                    file_path = os.path.join(tmp_dir, file_name)
+                    
+                    cv2.imwrite(file_path, frame)
+                    
+                    # Update all cameras to point to this file
+                    for c in target_cams:
+                        c._image_path = file_path
+                        # Remove video deps so _load_camera_image uses standard file loader
+                        if hasattr(c, '_video_path'): del c._video_path
+                        if hasattr(c, '_frame_idx'): del c._frame_idx
+                            
+                    extracted_count += 1
+                else:
+                    # Skip frame
+                    cap.grab()
+                
+                current_frame += 1
+                pbar.update(1)
+            
+            pbar.close()
+            cap.release()
+            print(f"   Extracted {extracted_count} frames for {os.path.basename(video_path)}")
+            
+    def cleanup_tmp(self):
+        """Cleanup temporary directory."""
+        if hasattr(self, 'tmp_dir') and os.path.exists(self.tmp_dir):
+            print(f"Cleaning up temporary directory: {self.tmp_dir}")
+            try:
+                shutil.rmtree(self.tmp_dir)
+            except Exception as e:
+                print(f"Warning: Failed to cleanup temp dir: {e}")
+
+    def _preload_video_frames(self, device="cpu"):
         """Preload all frames sequentially to avoid random seek overhead."""
         # 1. Group cameras by video file
         video_groups = {}
@@ -798,7 +892,7 @@ class SelfCapVideoDataset(GaussianDataset):
                      # Check if we should move to GPU immediately?
                      # data_device usually handles this. Here we store in RAM or cache_device
                      # If cache_device is 'cuda', we move it.
-                     if self.cache_device == "cuda":
+                     if device == "cuda":
                          image_tensor = image_tensor.cuda()
                      
                      # Assign to all cameras sharing this frame (unlikely but possible)

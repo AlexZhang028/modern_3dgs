@@ -54,8 +54,8 @@ class GaussianOptimizer:
         # Formula: Lr = Init^(1-t) * Final^t, where t = timestamp
         # Note: Strictly exponential, no warmup/delay.
         def get_velocity_scheduler(initial_lr, final_lr):
-            def scheduler(timestamp):
-                alpha = timestamp # Timestamp should be 0.0 to 1.0
+            def scheduler(progress):
+                alpha = progress # Progress should be 0.0 to 1.0
                 # Exponential decay: lr = init * (factor ^ alpha) 
                 # where factor = final / init
                 # or lr = init^(1-alpha) * final^alpha
@@ -65,7 +65,7 @@ class GaussianOptimizer:
         # Initial: 1.6e-4, Final: 1.6e-6 (factor 0.01)
         # Scaled by spatial_lr_scale as it is a motion (spatial) parameter
         vel_lr_init = config.velocity_lr * model.spatial_lr_scale
-        vel_lr_final = (config.velocity_lr * 0.1) * model.spatial_lr_scale
+        vel_lr_final = (config.velocity_lr * 0.5) * model.spatial_lr_scale
         
         self.velocity_scheduler = get_velocity_scheduler(
             initial_lr=vel_lr_init,

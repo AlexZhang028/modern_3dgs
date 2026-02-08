@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--test_views", nargs='+', type=str, default=None, help="Specific cameras for testing (overrides config)")
     parser.add_argument("--normalized_t", type=int, default=None, help="Use normalized time (0/1) or seconds. 1=True, 0=False")
     parser.add_argument("--fps", type=float, default=None, help="Override video FPS")
+    parser.add_argument("--use_tmp", action="store_true", help="Use temporary directory for frames")
     
     # Debug Arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -111,6 +112,10 @@ def merge_configs(yaml_config: dict, args: argparse.Namespace) -> dict:
         if 'data' not in config: config['data'] = {}
         config['data']['fps'] = args.fps
         
+    if args.use_tmp:
+        if 'data' not in config: config['data'] = {}
+        config['data']['use_tmp'] = True
+        
     # View Selection Overrides
     if args.train_views:
         # Clean input: remove brackets and commas if present
@@ -153,7 +158,20 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
     data_config = DataConfig(**config_dict.get('data', {}))
     
     # Optim Config
-    optim_config = OptimConfig(**config_dict.get('optim', {}))
+    # Merge 'densify' section into 'optim' for compatibility with OptimConfig shared fields
+    densify_dict = config_dict.get('densify', {})
+    optim_input = config_dict.get('optim', {}).copy()
+    
+    # Keys shared between DensificationConfig and OptimConfig
+    shared_densify_keys = [
+        'percent_dense', 'densify_from_iter', 'densify_until_iter', 
+        'densify_interval', 'densify_grad_threshold', 'opacity_reset_interval'
+    ]
+    for k in shared_densify_keys:
+        if k in densify_dict:
+            optim_input[k] = densify_dict[k]
+
+    optim_config = OptimConfig(**optim_input)
     
     # Model Config
     model_dict = config_dict.get('model', {}).copy()
@@ -171,6 +189,11 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
     
     # Trainer Config
     trainer_dict = config_dict.get('trainer', {})
+    
+    # Helper to get value from densify_dict -> optim_config -> default
+    def get_densify_param(key, fallback):
+        return densify_dict.get(key, fallback)
+
     trainer_config = TrainerConfig(
         iterations=optim_config.iterations,
         output_dir=data_config.model_path,
@@ -185,8 +208,8 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         densify_until_iter=optim_config.densify_until_iter,
         densify_interval=getattr(optim_config, 'densify_interval', getattr(optim_config, 'densification_interval', 100)),
         opacity_reset_interval=optim_config.opacity_reset_interval,
-        prune_opacity_threshold=0.005,
-        prune_size_threshold=20.0,
+        prune_opacity_threshold=densify_dict.get('prune_opacity_threshold', 0.005),
+        prune_size_threshold=densify_dict.get('prune_size_threshold', 20.0),
         enable_tensorboard=not args.disable_tensorboard,
         log_interval=trainer_dict.get('log_interval', config_dict.get('log_interval', 10)),
         test_interval=trainer_dict.get('test_interval', 1000),

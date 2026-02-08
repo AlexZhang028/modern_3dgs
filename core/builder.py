@@ -30,6 +30,12 @@ def setup_dataset(data_config: DataConfig, split: str = "train") -> Optional[Gau
         # Only print for train split to avoid spam
         if split == "train":
             print("   Multiprocessing enabled: Forcing dataset cache to CPU")
+            
+    # If using tmp storage/high-res, force CPU cache to avoid VRAM OOM
+    if data_config.use_tmp and dataset_cache_device == "cuda":
+        if split == "train":
+            print("   'use_tmp' enabled: Forcing dataset cache to CPU to save VRAM")
+        dataset_cache_device = "cpu"
 
     # Detect dataset type
     is_selfcap = (os.path.exists(os.path.join(data_config.source_path, "extri.yml")) or 
@@ -54,6 +60,7 @@ def setup_dataset(data_config: DataConfig, split: str = "train") -> Optional[Gau
             test_camera_names=data_config.test_cameras,
             train_camera_names=data_config.train_cameras,
             normalized_t=data_config.normalized_t,
+            use_tmp=data_config.use_tmp,
         )
         
         # Inject fps override if available
@@ -91,6 +98,11 @@ def setup_model(
     # Create model
     model = create_model_from_config(gaussian_config)
     
+    # Sync Normalized T Check
+    if model_config.normalized_t != data_config.normalized_t:
+        print(f"Warning: Configuration mismatch! Model normalized_t={model_config.normalized_t}, Data normalized_t={data_config.normalized_t}")
+        print("This may cause initialization issues. Recommend ensuring both are consistent.")
+
     # Important: Move to CUDA before create_from_pcd
     model = model.cuda()
     

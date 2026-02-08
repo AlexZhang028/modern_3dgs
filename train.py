@@ -153,7 +153,14 @@ def main():
         print(f"\n\nError during training: {e}")
         traceback.print_exc()
         raise
-    
+    finally:
+        # Cleanup temp datasets (if use_tmp is enabled)
+        # Note: We cleanup both train and test dirs
+        if train_dataset is not None and hasattr(train_dataset, "cleanup_tmp"):
+            train_dataset.cleanup_tmp()
+        if test_dataset is not None and hasattr(test_dataset, "cleanup_tmp"):
+            test_dataset.cleanup_tmp()
+
     print("\n" + "=" * 60)
     print("Training Complete!")
     print(f"   Model saved to {data_config.model_path}")

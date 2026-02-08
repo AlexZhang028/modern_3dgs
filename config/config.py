@@ -38,7 +38,7 @@ class DataConfig:
     num_workers: int = 4  # DataLoader workers
     pin_memory: bool = True  # Use pin_memory
     lazy_loading: bool = False  # Lazy loading (False = preload all images)
-    normalized_t: bool = True # Use normalized time (0-1) or seconds for dataset loading
+    normalized_t: bool = False # Use normalized time (0-1) or seconds for dataset loading
     
     # SelfCap / Video Dataset Options
     start_frame: int = 0  # Frame start index
@@ -46,6 +46,7 @@ class DataConfig:
     test_cameras: List[str] = field(default_factory=list)  # List of camera names to use for testing
     train_cameras: List[str] = field(default_factory=list)  # List of camera names to use for training
     fps: float = -1.0 # Override FPS for video datasets (-1 = auto)
+    use_tmp: bool = True # Use temporary directory for frame extraction (reduces IO bottleneck, cleans up after)
 
 
 
@@ -68,7 +69,7 @@ class ModelConfig:
     # FreeTimeGS Specific Parameters
     time_dim: int = 0  # Time dimension
     motion_dim: int = 0  # Motion dimension
-    normalized_t: bool = True # Use normalized time (0-1) or seconds
+    normalized_t: bool = False # Use normalized time (0-1) or seconds
     
     def __post_init__(self):
         assert self.mode in ["static", "freetime"], \

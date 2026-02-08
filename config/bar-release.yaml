@@ -1,5 +1,5 @@
 data:
-  cache_images: true
+  cache_images: false
   data_device: cuda
   eval: false
   images: images
@@ -8,13 +8,14 @@ data:
   model_path: /mnt/hdd/freetime/bar-release
   num_workers: 0
   pin_memory: true
-  resolution: 8
+  resolution: 4
   source_path: /mnt/hdd/selfcap/bar-release
   start_frame: 3190
   test_cameras:
   - '10'
   train_cameras:
   white_background: false
+  normalized_t: false
 densify:
   densify_from_iter: 500
   densify_grad_threshold: 0.0002
