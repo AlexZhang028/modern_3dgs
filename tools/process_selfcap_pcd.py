@@ -152,23 +152,55 @@ def main():
         print(f"Error: Directory {pcd_dir} not found.")
         return
 
-    files = sorted(glob.glob(os.path.join(pcd_dir, "*.ply")))
+    # Sort by frame index extracted from filename
+    def extract_frame_idx(fname):
+        base = os.path.basename(fname)
+        # Find all digits
+        import re
+        nums = re.findall(r'\d+', base)
+        if nums:
+            return int(nums[-1]) # Assume last number is frame index
+        return -1
+
+    files = sorted(glob.glob(os.path.join(pcd_dir, "*.ply")), key=extract_frame_idx)
     if not files:
         print(f"Error: No .ply files found in {pcd_dir}")
         return
 
-    # Filter by frame range
-    start_idx = args.start_frame
-    end_idx = args.end_frame if args.end_frame != -1 else len(files)
-    files = files[start_idx:end_idx]
+    # Determine Base Index (Logic: First file represents '0' offset? 
+    # Or start_frame relative to sorted list?)
+    # User requirement: "if first is 5200, start_frame 10 should load 5210"
+    # This implies start_frame is relative to the BEGINNING of the sequence found on disk.
+    
+    first_file_idx = extract_frame_idx(files[0])
+    target_start_idx = first_file_idx + args.start_frame
+    if args.end_frame != -1:
+        target_end_idx = first_file_idx + args.end_frame
+    else:
+        target_end_idx = -1 # All
+        
+    print(f"Dataset First Frame: {first_file_idx}")
+    print(f"Processing Range (Absolute): {target_start_idx} - {target_end_idx if target_end_idx != -1 else 'End'}")
+
+    filtered_files = []
+    for f in files:
+        idx = extract_frame_idx(f)
+        if idx >= target_start_idx:
+             if target_end_idx != -1 and idx >= target_end_idx:
+                 continue # Don't break immediately if not strictly contiguous, but here sorted...
+             filtered_files.append(f)
+    files = filtered_files
+    
+    # Filter by frame range (if user specifies start/end frame indices, matched against filename index)
+    # (Removed old logic to avoid double filtering)
 
     if not files:
-        print(f"Error: No files found in range {start_idx}-{end_idx}")
+        print(f"Error: No files found in target range.")
         return
 
     # Downsample frames
     files = files[::args.downsample_rate]
-    print(f"Found {len(files)} frames to process (range {start_idx}-{end_idx}, step {args.downsample_rate}).")
+    print(f"Found {len(files)} frames to process (step {args.downsample_rate}).")
 
     global_points = []
     global_colors = []
@@ -186,10 +218,12 @@ def main():
             indices = np.random.choice(len(pts), args.downsample_points, replace=False)
             pts = pts[indices]
             cols = cols[indices]
-            
+        
+        frame_idx = extract_frame_idx(fpath)
         frame_data_list.append({
             'pts': pts,
-            'cols': cols
+            'cols': cols,
+            'frame_idx': frame_idx
         })
     print("\nLoading complete.")
 
@@ -203,13 +237,47 @@ def main():
     
     total_frames = len(frame_data_list)
     
-    for t in range(total_frames):
-        curr_pts = frame_data_list[t]['pts']
-        curr_cols = frame_data_list[t]['cols']
+    # Try to load sync.json to correct timestamp if available
+    sync_offset = 0.0
+    # Assuming standard path structure: .../pcds/ -> .../optimized/sync.json or .../sync.json
+    root_path = args.source_path
+    sync_path1 = os.path.join(root_path, "optimized", "sync.json")
+    sync_path2 = os.path.join(root_path, "sync.json")
+    
+    # NOTE: sync.json usually contains offsets PER CAMERA.
+    # The PCDs are usually "fused" point clouds in World Space.
+    # Does the PCD sequence have a "sync offset"?
+    # If the PCDs are generated from "Camera 0" timeline or "Master" timeline, offset is 0.
+    # If PCDs are raw captures from a device, it might have offset.
+    # Usually we assume the PCD filename (e.g. 5200) refers to the MASTER timeline frame index.
+    # So t = (5200 - Start) / FPS.
+    # If the user asks for "Time computed from frame index - sync.json", they usually refer to Cameras.
+    # For PCD initialization, we usually assume the PCDs are already aligned to the timeline we want to train.
+    # BUT, to be safe, if there is a 'global' offset or if PCD is treated as a "Camera View", we might need it.
+    # Given the PCD script doesn't take a "Camera Name" arg, we can't look up a specific sync value.
+    # So we assume sync=0 for PCDs unless user provides a specific flag (which I won't add unless asked).
+    # However, strictly following "computed from frame index", I will use frame_idx directly.
+    
+    for i in range(total_frames):
+        curr_pts = frame_data_list[i]['pts']
+        curr_cols = frame_data_list[i]['cols']
+        frame_idx = frame_data_list[i]['frame_idx']
+        
+        # Time setup
+        # Timestamp should be relative to the requested start_frame
+        # If user asked for start_frame 10 (abs 5210), they expect t=0 to be at that point?
+        # Typically yes, training starts at t=0.
+        # User formula: time_sec = frameidx / 60. sync_time = time_sec - sync.
+        
+        # For PCD tool, we define 't' as relevant to the training Time 0.
+        # Let's use (frame_idx - target_start_idx) / fps.
+        # This assumes PCD filenames are synced with the "Master" timeline defined by start_frame.
+        
+        time_seconds = (frame_idx - target_start_idx) / args.fps
         
         # Determine target frame for motion estimation
-        if t < total_frames - 1:
-            target_pts = frame_data_list[t+1]['pts']
+        if i < total_frames - 1:
+            target_pts = frame_data_list[i+1]['pts']
         else:
             # Last frame: use previous frame to estimate "backwards" or just zero?
             # Doc suggests: velocity = 0 or use prev. We use velocity=0 for last frame simplicity for now
@@ -255,14 +323,9 @@ def main():
         velocity_filtered = velocity[keep_mask]
 
         # Time in seconds
-        # t is the index in the processed list (0, 1, 2...)
-        # The file selection logic was: files[start_idx:end_idx][::downsample_rate]
-        # So the original frame index relative to the start of the video is:
-        # frame_idx = idx_start + t * downsample_rate (if we consider local slicing)
-        # But `files` was globally sliced by `start_frame`.
-        # Time in seconds (Relative to start_frame, so start_frame is t=0.0)
-        frame_offset = t * args.downsample_rate
-        time_seconds = frame_offset / args.fps
+        # timestamp was calculated at start of loop
+        # time_seconds = timestamp 
+        # (var name changed in loop setup, using that)
         
         # normalized t (old behavior) -> seconds (new behavior)
         # norm_t_val = t / max(1, (total_frames - 1))
@@ -280,7 +343,7 @@ def main():
         
         static_count = len(static_indices)
         dropped_count = static_count - np.sum(keep_mask[static_indices])
-        print(f"Processed frame {t}/{total_frames-1}. Dropped {dropped_count} static points.", end='\r')
+        print(f"Processed frame {i}/{total_frames-1}. Dropped {dropped_count} static points.", end='\r')
         
     print("\nAggregation...")
     

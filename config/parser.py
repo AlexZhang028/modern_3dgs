@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--normalized_t", type=int, default=None, help="Use normalized time (0/1) or seconds. 1=True, 0=False")
     parser.add_argument("--fps", type=float, default=None, help="Override video FPS")
     parser.add_argument("--use_tmp", action="store_true", help="Use temporary directory for frames")
+    parser.add_argument("--lambda_lpips", type=float, default=None, help="LPIPS loss weight")
     
     # Debug Arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -94,6 +95,9 @@ def merge_configs(yaml_config: dict, args: argparse.Namespace) -> dict:
         config['data']['init_point_cloud_path'] = args.init_point_cloud
     if args.cache_images:
         config['data']['cache_images'] = True
+    if args.lambda_lpips is not None:
+        if 'optim' not in config: config['optim'] = {}
+        config['optim']['lambda_lpips'] = args.lambda_lpips
     
     # FreeTimeGS Overrides
     if args.start_frame is not None:
@@ -200,6 +204,7 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         white_background=data_config.white_background,
         random_background=optim_config.random_background,
         lambda_dssim=optim_config.lambda_dssim,
+        lambda_lpips=getattr(optim_config, 'lambda_lpips', 0.0),
         # Pass depth weights from optim_config to trainer_config
         depth_l1_weight_init=optim_config.depth_l1_weight_init,
         depth_l1_weight_final=optim_config.depth_l1_weight_final,
@@ -220,6 +225,11 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         num_test_views=trainer_dict.get('num_test_views', 5),
         save_ply=trainer_dict.get('save_ply', True),
         save_checkpoint=trainer_dict.get('save_checkpoint', False),
+        
+        # FreeTimeGS Specific
+        lambda_reg=trainer_dict.get('lambda_reg', 0.01),
+
+        relocation_interval=trainer_dict.get('relocation_interval', 500),
     )
     
     return data_config, model_config, optim_config, pipeline_config, trainer_config, config_dict

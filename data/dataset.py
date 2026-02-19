@@ -592,10 +592,11 @@ class SelfCapVideoDataset(GaussianDataset):
         self._load_selfcap_video_dataset()
 
     def _load_selfcap_video_dataset(self):
-        from .selfcap_loader import read_selfcap_cameras
+        from .selfcap_loader import read_selfcap_cameras, read_selfcap_sync
         
         # Load params (supports optimized/ folder)
         cam_names, extrinsics, intrinsics = read_selfcap_cameras(self.source_path)
+        sync_map = read_selfcap_sync(self.source_path)
         
         # Check for videos folder
         videos_root = os.path.join(self.source_path, "videos")
@@ -689,18 +690,45 @@ class SelfCapVideoDataset(GaussianDataset):
                  FovX = focal2fov(fx, curr_width)
                  FovY = focal2fov(fy, curr_height)
 
+            # Sync Offset
+            sync_offset = sync_map.get(name, 0.0)
+
             for idx in selected_indices:
-                image_name = f"{name}_frame_{idx:05d}"
+                # 1. Sync Logic (Align video streams)
+                # We iterate 'idx' as the Master Time Frame (Time = idx / FPS).
+                # To get the corresponding frame from this specific camera, we must reverse the sync formula:
+                # ActualTime = (FrameIdx / FPS) - SyncOffset
+                # => FrameIdx = (ActualTime + SyncOffset) * FPS
+                # => FrameIdx = (idx/FPS + SyncOffset) * FPS = idx + SyncOffset * FPS
                 
+                eff_idx = int(round(idx + sync_offset * fps))
+                
+                image_name = f"{name}_frame_{eff_idx:05d}"
+                
+                # 2. Precise Time Calculation
+                # We record the exact time of the loaded frame, NOT the ideal master time.
+                frame_time_sec = eff_idx / fps
+                actual_timestamp_sec = frame_time_sec - sync_offset
+                
+                # Relative to start frame (for normalized training time 0.0 -> Duration)
+                # Training start time corresponds to Master Frame 'start'
+                time_sec = actual_timestamp_sec - (start / fps)
+
                 # Time handling
                 # Normalization: [0, 1] mapped to [start_frame, end_frame]
+                # We use the precise time fraction
                 if subset_frame_count > 1:
-                    time_norm = (idx - start) / (subset_frame_count - 1)
+                     # duration in frames = subset_frame_count - 1
+                     # duration in seconds = (subset_frame_count - 1) / fps
+                     duration_sec = (subset_frame_count - 1) / fps
+                     if duration_sec > 0:
+                        time_norm = time_sec / duration_sec
+                     else:
+                        time_norm = 0.0
                 else:
                     time_norm = 0.0
                 
-                # Valid time in seconds (relative to start_frame)
-                time_sec = (idx - start) / fps
+                # Calculate downscaled dimensions used for Camera object
 
                 # Calculate downscaled dimensions used for Camera object
                 final_width = curr_width
@@ -731,7 +759,7 @@ class SelfCapVideoDataset(GaussianDataset):
                 
                 # Store video info
                 camera._video_path = video_path
-                camera._frame_idx = idx
+                camera._frame_idx = eff_idx
                 
                 all_cameras.append(camera)
 

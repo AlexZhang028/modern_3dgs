@@ -1,6 +1,25 @@
 import cv2
 import numpy as np
 import os
+import json
+
+def read_selfcap_sync(path):
+    """
+    Read synchronization file (optimized/sync.json).
+    Returns dictionary of frame/time offsets per camera.
+    """
+    sync_path = os.path.join(path, "optimized", "sync.json")
+    if not os.path.exists(sync_path):
+        sync_path = os.path.join(path, "sync.json")
+    
+    if os.path.exists(sync_path):
+        try:
+            with open(sync_path, 'r') as f:
+                return json.load(f)
+        except:
+            print(f"Warning: Failed to parse {sync_path}")
+            return {}
+    return {}
 
 def read_selfcap_cameras(path):
     """

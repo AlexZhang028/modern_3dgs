@@ -683,8 +683,8 @@ class FreeTimeGaussianModel(GaussianModel):
         
         # 5. Reset Duration -> random small duration, rand*2 -> [0,2]. -3 -> [-3, -1]. Correct.
         n_relocated = mask.sum()
-        random_scales = (torch.rand(n_relocated, 1, device="cuda") * 2.0) - 3.0 
-        self._t_scale[mask] = random_scales
+        random_tscales = (torch.rand(n_relocated, 1, device="cuda") * 2.0) - 3.0 
+        self._t_scale[mask] = random_tscales
 
 
 def detect_mode_from_ply(ply_path: str) -> str:

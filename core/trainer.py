@@ -74,7 +74,13 @@ class Trainer:
 
         
         # Create Loss Function
-        self.loss_fn = GaussianLoss(lambda_dssim=config.lambda_dssim)
+        self.loss_fn = GaussianLoss(
+            lambda_dssim=config.lambda_dssim,
+            lambda_lpips=config.lambda_lpips
+        )
+        # Move loss to device (important for LPIPS weights)
+        if config.lambda_lpips > 0:
+            self.loss_fn = self.loss_fn.cuda()
         
         # Create Densifier
         densify_config = DensificationConfig(
@@ -168,6 +174,9 @@ class Trainer:
         print("\n" + "=" * 60)
         print(f"Start Training ({self.mode} Mode)")
         print(f"   Iterations: {self.config.iterations}")
+        print(f"   L_DSSIM: {self.config.lambda_dssim}")
+        if hasattr(self.config, 'lambda_lpips'):
+            print(f"   L_LPIPS: {self.config.lambda_lpips}")
         print(f"   Initial Gaussians: {self.model.num_points}")
         print("=" * 60 + "\n")
         
@@ -188,10 +197,13 @@ class Trainer:
             metrics['iteration_time'] = (iter_end - iter_start) * 1000.0
             
             # Update Progress Bar
-            progress_bar.set_postfix({
+            postfix = {
                 'loss': f"{metrics['loss']:.4f}",
                 'gaussians': self.model.num_points
-            })
+            }
+            if 'lpips' in metrics:
+                postfix['lpips'] = f"{metrics['lpips']:.4f}"
+            progress_bar.set_postfix(postfix)
             
             # Logging
             if iteration % self.config.log_interval == 0:
@@ -422,6 +434,9 @@ class Trainer:
             'ssim': loss_components['ssim'].item(),
             'num_gaussians': self.model.num_points
         }
+        if 'lpips' in loss_components:
+             val = loss_components['lpips']
+             metrics['lpips'] = val.item() if hasattr(val, 'item') else val
 
         # Explicit cleanup to allow GC to reclaim graph immediately
         del rendered
@@ -494,6 +509,8 @@ class Trainer:
             self.writer.add_scalar('Loss/total', metrics['loss'], iteration)
             self.writer.add_scalar('Loss/l1', metrics['l1'], iteration)
             self.writer.add_scalar('Loss/ssim', metrics['ssim'], iteration)
+            if 'lpips' in metrics:
+                self.writer.add_scalar('Loss/lpips', metrics['lpips'], iteration)
             if 'iteration_time' in metrics:
                 self.writer.add_scalar('Stats/iteration_time', metrics['iteration_time'], iteration)
             self.writer.add_scalar('Stats/num_gaussians', metrics['num_gaussians'], iteration)
@@ -680,8 +697,8 @@ class FreeTimeTrainer(Trainer):
         base_opacity = rendered['base_opacity']
         temporal_weight = rendered['temporal_weight']
         
-        # Weight 0.01 constant
-        reg_weight = 0.01
+        # Weight from config
+        reg_weight = self.config.lambda_reg
         
         # Only detach the temporal instance component
         # We penalize base_opacity if the gaussian is active at this time (high temporal_weight)

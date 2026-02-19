@@ -1,0 +1,47 @@
+data:
+  cache_images: false
+  data_device: cuda
+  eval: false
+  images: images
+  init_point_cloud_path: ''
+  lazy_loading: true
+  model_path: /mnt/hdd/freetime/corgi/dense_safe
+  num_workers: 0
+  pin_memory: true
+  resolution: 4
+  source_path: /mnt/hdd/selfcap/corgi-release
+  start_frame: 2950
+  end_frame: 3010
+  test_cameras:
+  - '0007'
+  train_cameras:
+  white_background: false
+  normalized_t: false
+densify:
+  densify_from_iter: 500
+  densify_grad_threshold: 0.00006 # More aggressive than default (0.0001) but safe
+  densify_interval: 100
+  densify_until_iter: 40000       # Densify longer
+  prune_opacity_threshold: 0.005
+model:
+  mode: freetime
+  percent_dense: 0.01
+  sh_degree: 3
+optim:
+  feature_lr: 0.0025
+  iterations: 50000
+  lambda_dssim: 0.2
+  opacity_lr: 0.025
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  t_lr: 0.0001
+  t_scale_lr: 0.005
+  velocity_lr: 0.00016
+trainer:
+  lambda_reg: 0.01      # User Requested Safe Value
+  log_interval: 10
+  relocation_interval: 100
+  save_interval: 5000
+  test_interval: 5000

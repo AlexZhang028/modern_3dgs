@@ -119,6 +119,7 @@ class OptimConfig:
     
     # Loss Weights
     lambda_dssim: float = 0.2
+    lambda_lpips: float = 0.01
     depth_l1_weight_init: float = 1.0
     depth_l1_weight_final: float = 0.01
     
@@ -243,12 +244,12 @@ class TrainerConfig:
     
     # Loss Weights
     lambda_dssim: float = 0.2
+    lambda_lpips: float = 0.01
     depth_l1_weight_init: float = 1.0 
     depth_l1_weight_final: float = 0.01
 
     # FreeTimeGS Specific Training Params
-    lambda_reg: float = 1.0        # 4D Regularization weight
-    reg_end_iter: int = 3000       # Iteration to stop regularization
+    lambda_reg: float = 0.01       # 4D Regularization weight
     relocation_interval: int = 500 # Iteration interval for relocation
 
 # ============================================================================

@@ -23,6 +23,12 @@ except:
     FUSED_SSIM_AVAILABLE = False
     pass
 
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    pass
 
 # SSIM Constants
 C1 = 0.01 ** 2
@@ -264,10 +270,32 @@ class GaussianLoss(nn.Module):
         use_fused_ssim: Whether to use Fused SSIM (if available).
     """
     
-    def __init__(self, lambda_dssim: float = 0.2, use_fused_ssim: bool = True):
+    def __init__(self, lambda_dssim: float = 0.2, lambda_lpips: float = 0.0, use_fused_ssim: bool = True):
         super().__init__()
         self.lambda_dssim = lambda_dssim
+        self.lambda_lpips = lambda_lpips
         self.use_fused_ssim = use_fused_ssim and FUSED_SSIM_AVAILABLE
+        
+        self.lpips_model = None
+        if self.lambda_lpips > 0:
+            if LPIPS_AVAILABLE:
+                print("Initializing LPIPS Loss (VGG)...")
+                # Suppress LPIPS print
+                import sys, os
+                with open(os.devnull, 'w') as f:
+                    # Redirect stdout to avoid spam
+                    old = sys.stdout
+                    try:
+                        sys.stdout = f
+                        self.lpips_model = lpips.LPIPS(net='vgg')
+                    finally:
+                        sys.stdout = old
+                
+                for param in self.lpips_model.parameters():
+                    param.requires_grad = False
+            else:
+                print("Warning: LPIPS requested but `lpips` package not found. Skipping LPIPS loss.")
+                self.lambda_lpips = 0.0
         
         if not FUSED_SSIM_AVAILABLE and use_fused_ssim:
             print("Warning: Fused SSIM not available, using standard SSIM implementation.")
@@ -295,6 +323,18 @@ class GaussianLoss(nn.Module):
         # Combine
         loss = (1.0 - self.lambda_dssim) * l1 + self.lambda_dssim * (1.0 - ssim_val)
         
+        # LPIPS Loss
+        if self.lambda_lpips > 0 and self.lpips_model is not None:
+            # Normalize [0, 1] -> [-1, 1]
+            pred_norm = pred * 2.0 - 1.0
+            target_norm = target * 2.0 - 1.0
+            # LPIPS forward takes [B, C, H, W] or [C, H, W] but usually expects batch dim? 
+            # lpips library handles unbatched, but let's be safe.
+            # Assuming pred is [3, H, W] (from renderer output)
+            
+            # Since renderer returns [3,H,W], lpips usually expects [B,3,H,W]
+            loss += self.lambda_lpips * self.lpips_model(pred_norm.unsqueeze(0), target_norm.unsqueeze(0)).mean()
+            
         return loss
     
     def get_components(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
@@ -317,11 +357,19 @@ class GaussianLoss(nn.Module):
         
         total_loss = (1.0 - self.lambda_dssim) * l1 + self.lambda_dssim * (1.0 - ssim_val)
         
+        lpips_val = 0.0
+        if self.lambda_lpips > 0 and self.lpips_model is not None:
+             pred_norm = pred * 2.0 - 1.0
+             target_norm = target * 2.0 - 1.0
+             lpips_val = self.lpips_model(pred_norm.unsqueeze(0), target_norm.unsqueeze(0)).mean()
+             total_loss += self.lambda_lpips * lpips_val
+
         return {
             'total': total_loss,
             'l1': l1,
             'ssim': ssim_val,
-            'dssim': 1.0 - ssim_val
+            'dssim': 1.0 - ssim_val,
+            'lpips': lpips_val if isinstance(lpips_val, float) else lpips_val.item()
         }
 
 
