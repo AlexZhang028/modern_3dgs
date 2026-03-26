@@ -1,0 +1,29 @@
+# Configuration for SelfCap PCD initialization
+
+# Base Paths (Required)
+source_path: "/mnt/hdd/freetime_gs/data/corgi-release/"
+output_path: "/mnt/hdd/freetime_gs/data/corgi-release/points3d.ply"
+pcd_subfolder: "pcds"
+
+# Frame Processing Range
+start_frame: 2950
+end_frame: 3010
+downsample_rate: 1
+fps: 60.0
+
+# Point Limits and Densities
+downsample_points: 10000        # Max points to load per frame initially
+max_total_points: 500000        # Max points allowed in the final merged PLY
+
+# Static/Dynamic Thresholding
+static_vel_threshold: 0.1       # Max velocity to still be considered static
+static_keep_ratio: 0.1          # Retain this percentage of static points to give background structure
+max_vel_threshold: 1.0          # Ignore points faster than this completely (usually KNN noise)
+
+# Advanced Filtering Models
+color_weight: 0.5               # Weight for color distance in KNN correspondence (0.0 disables it)
+smooth_k: 8                     # Size of KNN neighborhood for velocity median smoothing (0 disables it)
+
+# Compute and Render
+device: "cuda"
+sh_degree: 3                    # Number of SH degrees to initialize

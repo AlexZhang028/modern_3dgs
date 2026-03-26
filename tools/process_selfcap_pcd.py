@@ -25,12 +25,14 @@ import argparse
 import glob
 import numpy as np
 import torch
+import yaml
 from plyfile import PlyData, PlyElement
 import sys
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Process SelfCap PCDs for FreeTimeGS")
-    parser.add_argument("--source_path", type=str, required=True, help="Path to the dataset root (containing pcds/ folder)")
+    parser.add_argument("--config", type=str, default="", help="Path to YAML config file")
+    parser.add_argument("--source_path", type=str, default=None, help="Path to the dataset root (containing pcds/ folder)")
     parser.add_argument("--output_path", type=str, default="init_freetime.ply", help="Output PLY name")
     parser.add_argument("--pcd_subfolder", type=str, default="pcds", help="Subfolder containing per-frame PLYs")
     parser.add_argument("--start_frame", type=int, default=0, help="Start frame index (default: 0)")
@@ -38,11 +40,31 @@ def parse_args():
     parser.add_argument("--downsample_rate", type=int, default=10, help="Process every K-th frame (default: 10)")
     parser.add_argument("--downsample_points", type=int, default=10000, help="Max points per frame to load initially (random sample)")
     parser.add_argument("--max_total_points", type=int, default=100000, help="Maximum allowable points in final PLY. Will randomly downsample if exceeded.")
-    parser.add_argument("--static_vel_threshold", type=float, default=0.01, help="Velocity magnitude threshold to consider a point static (background).")
-    parser.add_argument("--static_keep_ratio", type=float, default=0.1, help="Ratio of static points to keep (0.0-1.0).")
+    parser.add_argument("--static_vel_threshold", type=float, default=0.1, help="Velocity magnitude threshold to consider a point static (background).")
+    parser.add_argument("--static_keep_ratio", type=float, default=0.1, help="Ratio of static points to  keep (0.0-1.0).")
+    parser.add_argument("--max_vel_threshold", type=float, default=2.0, help="Max allowable velocity; points exceeding this are discarded as noise (flying points).")
     parser.add_argument("--device", type=str, default="cuda", help="Compute device (cuda/cpu)")
-    parser.add_argument("--fps", type=float, default=30.0, help="Frames per second (default: 30.0)")
-    return parser.parse_args()
+    parser.add_argument("--fps", type=float, default=60.0, help="Frames per second (default: 30.0)")
+    parser.add_argument("--sh_degree", type=int, default=3, help="SH degree for initialization (default: 3)")
+    parser.add_argument("--color_weight", type=float, default=0.5, help="Weight for color in KNN matching (Scheme A)")
+    parser.add_argument("--smooth_k", type=int, default=5, help="KNN neighborhood size for velocity median smoothing (Scheme C)")
+    
+    args = parser.parse_args()
+    
+    # Load parameters from yaml if provided.
+    # Note: YAML values overwrite command line defaults when specified.
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            yaml_config = yaml.safe_load(f)
+            if yaml_config:
+                for k, v in yaml_config.items():
+                    if hasattr(args, k):
+                        setattr(args, k, v)
+    
+    if args.source_path is None:
+        parser.error("--source_path must be provided via command line or config yaml.")
+        
+    return args
 
 def read_ply_points(path):
     plydata = PlyData.read(path)
@@ -113,12 +135,40 @@ def compute_scales(points, k=3, device='cuda'):
         
     return scales.cpu().numpy()
 
-def find_knn_correspondence(query_np, target_np, k=1, device='cuda'):
+def smooth_velocities(pts_np, vel_np, k=5, device='cuda'):
+    if not torch.cuda.is_available():
+        device = 'cpu'
+        
+    pts = torch.from_numpy(pts_np).float().to(device)
+    vel = torch.from_numpy(vel_np).float().to(device)
+    N = pts.shape[0]
+    
+    smoothed = torch.zeros_like(vel)
+    chunk_size = 5000
+    for i in range(0, N, chunk_size):
+        chunk = pts[i:i+chunk_size]
+        dist = torch.cdist(chunk.unsqueeze(0), pts.unsqueeze(0)).squeeze(0) # [Batch, N]
+        _, idx = torch.topk(dist, k=k+1, dim=1, largest=False)
+        # gather neighbor velocities
+        neighbor_vels = vel[idx] # [Batch, k+1, 3]
+        # median smoothing (dim 1 is the neighborhood)
+        median_vel, _ = torch.median(neighbor_vels, dim=1)
+        smoothed[i:i+chunk_size] = median_vel
+        
+    return smoothed.cpu().numpy()
+
+def find_knn_correspondence(query_np, target_np, query_col_np=None, target_col_np=None, color_weight=0.0, k=1, device='cuda'):
     if not torch.cuda.is_available():
         device = 'cpu'
         
     query = torch.from_numpy(query_np).float().to(device)
     target = torch.from_numpy(target_np).float().to(device)
+    
+    if color_weight > 0.0 and query_col_np is not None and target_col_np is not None:
+        q_cols = torch.from_numpy(query_col_np).float().to(device)
+        t_cols = torch.from_numpy(target_col_np).float().to(device)
+        query = torch.cat([query, q_cols * (color_weight ** 0.5)], dim=1)
+        target = torch.cat([target, t_cols * (color_weight ** 0.5)], dim=1)
     
     N = query.shape[0]
     M = target.shape[0]
@@ -239,24 +289,10 @@ def main():
     
     # Try to load sync.json to correct timestamp if available
     sync_offset = 0.0
-    # Assuming standard path structure: .../pcds/ -> .../optimized/sync.json or .../sync.json
-    root_path = args.source_path
-    sync_path1 = os.path.join(root_path, "optimized", "sync.json")
-    sync_path2 = os.path.join(root_path, "sync.json")
     
-    # NOTE: sync.json usually contains offsets PER CAMERA.
-    # The PCDs are usually "fused" point clouds in World Space.
-    # Does the PCD sequence have a "sync offset"?
-    # If the PCDs are generated from "Camera 0" timeline or "Master" timeline, offset is 0.
-    # If PCDs are raw captures from a device, it might have offset.
-    # Usually we assume the PCD filename (e.g. 5200) refers to the MASTER timeline frame index.
-    # So t = (5200 - Start) / FPS.
-    # If the user asks for "Time computed from frame index - sync.json", they usually refer to Cameras.
-    # For PCD initialization, we usually assume the PCDs are already aligned to the timeline we want to train.
-    # BUT, to be safe, if there is a 'global' offset or if PCD is treated as a "Camera View", we might need it.
-    # Given the PCD script doesn't take a "Camera Name" arg, we can't look up a specific sync value.
-    # So we assume sync=0 for PCDs unless user provides a specific flag (which I won't add unless asked).
-    # However, strictly following "computed from frame index", I will use frame_idx directly.
+    # Time delta for velocity calculation
+    dt = args.downsample_rate / args.fps
+    if dt <= 0: dt = 1.0/30.0 # Safety
     
     for i in range(total_frames):
         curr_pts = frame_data_list[i]['pts']
@@ -286,11 +322,16 @@ def main():
             
         if target_pts is not None:
             # KNN to find correspondence
-            indices = find_knn_correspondence(curr_pts, target_pts, k=1, device=args.device)
+            target_cols = frame_data_list[i+1]['cols']
+            indices = find_knn_correspondence(curr_pts, target_pts, curr_cols, target_cols, color_weight=args.color_weight, k=1, device=args.device)
             indices = indices.flatten()
             
             nearest_pts = target_pts[indices]
-            velocity = nearest_pts - curr_pts
+            displacement = nearest_pts - curr_pts
+            velocity = displacement / dt
+            
+            if args.smooth_k > 0:
+                velocity = smooth_velocities(curr_pts, velocity, k=args.smooth_k, device=args.device)
         else:
             velocity = np.zeros_like(curr_pts)
             
@@ -298,24 +339,32 @@ def main():
         # Calculate speed (magnitude of velocity)
         speed = np.linalg.norm(velocity, axis=1)
         is_static = speed < args.static_vel_threshold
+        is_flying = speed > args.max_vel_threshold
+        
+        # We explicitly force static points to have strictly ZERO velocity
+        # so they don't do "Brownian motion" when retained (e.g. from Frame 0)
+        velocity[is_static] = 0.0
         
         # Decide which points to keep
         # Start by keeping everything
         keep_mask = np.ones(len(curr_pts), dtype=bool)
         
-        # Identify static indices
+        # Identify static and flying indices
         static_indices = np.where(is_static)[0]
-        if len(static_indices) > 0 and args.static_keep_ratio < 1.0:
-            # We want to keep only a fraction
-            num_keep = int(len(static_indices) * args.static_keep_ratio)
-            # Since we want consistency, random choice might be flickering if we re-ran?
-            # But here we just want density reduction. Random is fine.
-            # Set all static to False first
-            keep_mask[static_indices] = False
-            # Choose lucky winners
-            if num_keep > 0:
-                winners = np.random.choice(static_indices, num_keep, replace=False)
-                keep_mask[winners] = True
+        flying_indices = np.where(is_flying)[0]
+        
+        # 1. Drop flying points completely (these are usually KNN mismatch noise)
+        keep_mask[flying_indices] = False
+        
+        if len(static_indices) > 0:
+            # Apply ratio to limit static density across ALL frames
+            # This ensures we don't accidentally wipe out dynamic points that temporarily stop moving
+            if args.static_keep_ratio < 1.0:
+                num_keep = int(len(static_indices) * args.static_keep_ratio)
+                keep_mask[static_indices] = False
+                if num_keep > 0:
+                    winners = np.random.choice(static_indices, num_keep, replace=False)
+                    keep_mask[winners] = True
         
         # Filter arrays
         curr_pts_filtered = curr_pts[keep_mask]
@@ -343,7 +392,8 @@ def main():
         
         static_count = len(static_indices)
         dropped_count = static_count - np.sum(keep_mask[static_indices])
-        print(f"Processed frame {i}/{total_frames-1}. Dropped {dropped_count} static points.", end='\r')
+        dropped_flying = len(flying_indices)
+        print(f"Processed frame {i}/{total_frames-1}. Dropped {dropped_count} static, {dropped_flying} flying points.", end='\r')
         
     print("\nAggregation...")
     
@@ -399,6 +449,14 @@ def main():
     all_rots[:, 0] = 1.0
 
     # SH Features (DC only for init, rest 0)
+    # SH Rest (Higher orders)
+    # If args.sh_degree > 0, we should initialize f_rest to 0 to avoid garbage colors if loaded directly
+    num_rest_coeffs = ((args.sh_degree + 1) ** 2 - 1) * 3
+    if num_rest_coeffs > 0:
+        all_f_rest = np.zeros((num_points, num_rest_coeffs), dtype=np.float32)
+    else:
+        all_f_rest = None
+    
     # Convert RGB to SH DC
     # C0 = 0.28209479177387814
     C0 = 0.28209479177387814
@@ -424,10 +482,18 @@ def main():
         ('opacity', 'f4'),
         ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
         ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4'),
-        ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
+        ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4')
+    ]
+    
+    # 动态添加高阶球谐特征 f_rest
+    if all_f_rest is not None:
+        for i in range(all_f_rest.shape[1]):
+            dtype.append((f'f_rest_{i}', 'f4'))
+
+    dtype.extend([
         ('t', 'f4'), ('t_scale', 'f4'),
         ('motion_0', 'f4'), ('motion_1', 'f4'), ('motion_2', 'f4')
-    ]
+    ])
     
     elements = np.empty(num_points, dtype=dtype)
     elements['x'] = all_xyz[:, 0]
@@ -458,6 +524,10 @@ def main():
     elements['f_dc_0'] = all_f_dc[:, 0]
     elements['f_dc_1'] = all_f_dc[:, 1]
     elements['f_dc_2'] = all_f_dc[:, 2]
+    
+    if all_f_rest is not None:
+        for i in range(all_f_rest.shape[1]):
+            elements[f'f_rest_{i}'] = all_f_rest[:, i]
     
     elements['t'] = all_t[:, 0]
     elements['t_scale'] = all_t_scale[:, 0]

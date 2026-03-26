@@ -210,11 +210,10 @@ class Trainer:
                 self._log_metrics(iteration, metrics)
             
             # Testing
-            if self.test_dataset:
-                is_test_interval = (self.config.test_interval > 0) and (iteration % self.config.test_interval == 0)
-                is_test_iter = iteration in self.config.test_iterations
-                if is_test_interval or is_test_iter:
-                    self._test(iteration)
+            is_test_interval = (self.config.test_interval > 0) and (iteration % self.config.test_interval == 0)
+            is_test_iter = iteration in self.config.test_iterations
+            if is_test_interval or is_test_iter:
+                self._test(iteration)
             
             # Save Checkpoint
             is_save_interval = (self.config.save_interval > 0) and (iteration % self.config.save_interval == 0) and (iteration > 0)
@@ -227,8 +226,7 @@ class Trainer:
         self.save_checkpoint(self.config.iterations, final=True)
 
         # Final Test
-        if self.test_dataset:
-             self._test(self.config.iterations)
+        self._test(self.config.iterations)
         
         if self.writer:
             self.writer.close()

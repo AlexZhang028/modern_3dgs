@@ -1,28 +1,29 @@
 data:
   cache_images: false
   data_device: cuda
+  end_frame: 3010
   eval: false
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: /mnt/hdd/freetime/corgi-release
+  model_path: /mnt/hdd/freetime_gs/res/corgi/220326_1653
+  normalized_t: false
   num_workers: 0
   pin_memory: true
-  resolution: 2
-  source_path: /mnt/hdd/selfcap/corgi-release
+  resolution: 4
+  source_path: /mnt/hdd/freetime_gs/data/corgi-release
   start_frame: 2950
-  end_frame: 3010
   test_cameras:
-  - '0007'
-  train_cameras:
+  - ''
+  train_cameras: null
   white_background: false
-  normalized_t: false
 densify:
   densify_from_iter: 500
   densify_grad_threshold: 0.0001
   densify_interval: 100
-  densify_until_iter: 30000
+  densify_until_iter: 15000
   prune_opacity_threshold: 0.005
+iterations: 50000
 model:
   mode: freetime
   percent_dense: 0.01
@@ -42,7 +43,6 @@ optim:
 trainer:
   lambda_reg: 0.01
   log_interval: 10
-  reg_end_iter: 30000
   relocation_interval: 100
   save_interval: 5000
   test_interval: 5000
