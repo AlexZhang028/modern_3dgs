@@ -47,6 +47,7 @@ class DataConfig:
     train_cameras: List[str] = field(default_factory=list)  # List of camera names to use for training
     fps: float = -1.0 # Override FPS for video datasets (-1 = auto)
     use_tmp: bool = True # Use temporary directory for frame extraction (reduces IO bottleneck, cleans up after)
+    inference_only: bool = False # Do not preload or extract frames, only load camera params.
 
 
 

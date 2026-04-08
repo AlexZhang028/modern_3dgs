@@ -580,6 +580,66 @@ class Trainer:
                     
                     # Render result on every log
                     self.writer.add_image(f'{prefix}_Render/{camera.image_name}', prediction, iteration)
+
+                    # 5. Gradient Contribution Map
+                    with torch.enable_grad():
+                        rendered_grad = self.renderer(
+                            gaussians=self.model,
+                            camera=camera,
+                            bg_color=self.bg_color,
+                            timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
+                            enable_culling=False
+                        )
+                        pred_grad = rendered_grad['render']
+                        
+                        if hasattr(camera, 'alpha_mask') and camera.alpha_mask is not None:
+                            alpha_mask = camera.alpha_mask.cuda()
+                            pred_grad = pred_grad * alpha_mask
+
+                        loss_comp = self.loss_fn.get_components(pred_grad, target)
+                        loss_grad = loss_comp['total']
+                        
+                        if hasattr(camera, 'depth_map') and camera.depth_map is not None and camera.depth_reliable:
+                            weight = self.depth_l1_weight(iteration)
+                            if weight > 0:
+                                invDepth = rendered_grad["depth"]
+                                mono_invdepth = camera.depth_map.cuda()
+                                depth_mask = camera.depth_mask.cuda()
+                                Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).mean()
+                                loss_grad += weight * Ll1depth_pure
+                        
+                        loss_grad.backward()
+                        
+                        viewspace_points = rendered_grad['viewspace_points']
+                        grad_color = None
+                        if viewspace_points.grad is not None:
+                            import matplotlib.cm as cm
+                            import numpy as np
+                            
+                            grad_norm = torch.norm(viewspace_points.grad[:, :2], dim=-1, keepdim=True)
+                            max_grad = self.config.densify_grad_threshold
+                            grad_norm_normalized = torch.clamp(grad_norm / (max_grad + 1e-5), 0.0, 1.0).squeeze(-1)
+                            
+                            # Apply plasma colormap
+                            plasma_map = cm.get_cmap('plasma')
+                            grad_color_np = plasma_map(grad_norm_normalized.detach().cpu().numpy())[:, :3]
+                            grad_color = torch.from_numpy(grad_color_np).to(dtype=torch.float32, device="cuda")
+                        
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.model.zero_grad(set_to_none=True)
+                    
+                    if grad_color is not None:
+                        rendered_vis = self.renderer(
+                            gaussians=self.model,
+                            camera=camera,
+                            bg_color=torch.tensor([0.0, 0.0, 0.0], device="cuda"),
+                            timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
+                            enable_culling=False,
+                            colors_override=grad_color
+                        )
+                        self.writer.add_image(f'{prefix}_GradMap/{camera.image_name}', rendered_vis['render'].clamp(0.0, 1.0), iteration)
+
+
         
         # Compute Averages
         avg_l1 = torch.tensor(l1_list).mean().item()

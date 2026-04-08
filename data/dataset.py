@@ -46,6 +46,7 @@ class GaussianDataset(Dataset):
         train_camera_names: Optional[List[str]] = None,
         normalized_t: bool = True,
         use_tmp: bool = False,
+        inference_only: bool = False,
     ):
         """
         Args:
@@ -66,6 +67,7 @@ class GaussianDataset(Dataset):
             train_camera_names: List of camera names to use for training (overrides default split)
             normalized_t: Whether to use normalized time [0,1] or seconds.
             use_tmp: Use temporary directory for extracted frames.
+            inference_only: Do not preload or extract frames, only load camera params.
         """
         self.source_path = source_path
         self.split = split
@@ -85,6 +87,7 @@ class GaussianDataset(Dataset):
         self.normalized_t = normalized_t
         self.fps = -1.0 
         self.use_tmp = use_tmp
+        self.inference_only = inference_only
 
         # Store camera info
         self.cameras: List[Camera] = []
@@ -246,7 +249,13 @@ class GaussianDataset(Dataset):
                 camera.depth_reliable = image_data["depth_reliable"]
         else:
             # Lazy load
-            self._load_camera_image(camera)
+            if not self.inference_only:
+                if hasattr(camera, '_image_path') or hasattr(camera, '_video_path'):
+                    self._load_camera_image(camera)
+                else:
+                    # When missing video deps and lazy loaded context
+                    # We skip image loading and just return camera wrapper instead of crashing
+                    pass
             
             # Cache if enabled
             if self.cache_device:
@@ -768,6 +777,12 @@ class SelfCapVideoDataset(GaussianDataset):
         self._load_initial_point_cloud()
         print(f"Loaded {len(self.cameras)} frames from SelfCap Video dataset")
         
+        # In viewer/inference mode where we don't need GT images or use lazy loading blindly
+        # we might skip preloading/extracting entirely if caching is off
+        if self.inference_only:
+            print("Skipping frame extraction/preloading (Inference Only mode).")
+            return
+            
         # Preload Video Frames optimization
         if self.use_tmp:
             self._extract_frames_to_tmp()

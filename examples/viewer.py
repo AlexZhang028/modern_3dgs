@@ -596,6 +596,14 @@ def main():
     parser.add_argument("--end_time", type=float, default=-1, help="End time for dynamic playback")
     parser.add_argument("--loop", action="store_true", help="Loop the animation")
     
+    # Optional arguments for rendering specific camera from dataset
+    parser.add_argument("--source_path", type=str, default="", help="Path to dataset root (Req if --cam is used)")
+    parser.add_argument("--cam", type=str, default=None, help="Name of the camera to render from dataset, e.g., '0007'")
+    parser.add_argument("--output_gt", action="store_true", help="If set and --cam is used, output GT video as well")
+    parser.add_argument("--resolution", type=int, default=1, help="Dataset resolution factor (1, 2, 4, 8) if rendering --cam")
+    parser.add_argument("--start_frame", type=int, default=0, help="Start frame for rendering dataset (only applies to --cam)")
+    parser.add_argument("--end_frame", type=int, default=-1, help="End frame for rendering dataset (only applies to --cam)")
+    
     args = parser.parse_args()
     
     seed_everything(0)
@@ -631,7 +639,91 @@ def main():
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
             
-        if mode == "static":
+        if args.cam:
+            print(f"Rendering Specific Camera '{args.cam}' from {args.source_path}...")
+            from core.builder import setup_dataset
+            from config.config import DataConfig
+            
+            if not args.source_path:
+                print("Error: --source_path is required when using --cam")
+                return
+                
+            data_config = DataConfig(
+                source_path=args.source_path,
+                resolution=args.resolution,
+                eval=True,
+                test_cameras=[args.cam],
+                start_frame=args.start_frame,
+                end_frame=args.end_frame,
+                use_tmp=args.output_gt,       # 如果不需要 GT，就不要去抽取所有帧
+                cache_images=False, # 防止加载时把图片缓存到内存中
+                lazy_loading=True, # 防止默认行为把全部数据读到内存
+                inference_only=not args.output_gt
+            )
+            dataset = setup_dataset(data_config, split="test")
+            
+            if not dataset or len(dataset) == 0:
+                print(f"Error: No frames found for camera '{args.cam}'")
+                return
+                
+            # sort by time
+            sorted_indices = sorted(range(len(dataset)), key=lambda i: dataset.cameras[i].timestamp)
+            
+            n_frames = len(sorted_indices)
+            first_cam = dataset.cameras[sorted_indices[0]]
+            render_w = first_cam.width
+            render_h = first_cam.height
+            
+            print(f"Found {n_frames} frames. Resolution: {render_w}x{render_h}")
+            
+            out_path = f"{args.output}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(out_path, fourcc, args.fps, (render_w, render_h))
+            
+            out_gt = None
+            if args.output_gt:
+                out_gt_path = f"{args.output}_gt.mp4"
+                out_gt = cv2.VideoWriter(out_gt_path, fourcc, args.fps, (render_w, render_h))
+                
+            bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+            
+            for i in tqdm(sorted_indices):
+                sample = dataset[i]
+                cam_data = sample['camera'].to(args.device)
+                
+                with torch.no_grad():
+                    if mode == "freetime":
+                        out_dict = renderer(gaussians, cam_data, bg_color, timestamp=cam_data.timestamp, enable_culling=True)
+                    else:
+                        out_dict = renderer(gaussians, cam_data, bg_color)
+                
+                img_render = out_dict['render'].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                out.write(cv2.cvtColor((img_render * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                
+                if out_gt is not None:
+                    img_gt = sample['image'].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                    out_gt.write(cv2.cvtColor((img_gt * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                    
+                # Free memory to prevent OOM
+                cam_data.image = None
+                cam_data.alpha_mask = None
+                cam_data.depth_map = None
+                cam_data.depth_mask = None
+                
+                # Delete local references
+                del out_dict
+                del img_render
+                del sample
+                if i % 10 == 0:
+                    torch.cuda.empty_cache()
+                    
+            out.release()
+            print(f"Saved video to {out_path}")
+            if out_gt is not None:
+                out_gt.release()
+                print(f"Saved GT video to {out_gt_path}")
+                
+        elif mode == "static":
             print("Rendering Static Image...")
             img, _ = render_preview_static(gaussians, renderer, control, args.width, args.height, args.fov)
             out_path = f"{args.output}.png"

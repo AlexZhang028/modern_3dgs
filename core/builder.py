@@ -61,6 +61,7 @@ def setup_dataset(data_config: DataConfig, split: str = "train") -> Optional[Gau
             train_camera_names=data_config.train_cameras,
             normalized_t=data_config.normalized_t,
             use_tmp=data_config.use_tmp,
+            inference_only=getattr(data_config, 'inference_only', False),
         )
         
         # Inject fps override if available

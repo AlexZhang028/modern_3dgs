@@ -6,7 +6,7 @@ data:
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: /mnt/hdd/freetime_gs/res/corgi/220326_1653
+  model_path: /mnt/hdd/freetime_gs/res/corgi/grad_vis
   normalized_t: false
   num_workers: 0
   pin_memory: true

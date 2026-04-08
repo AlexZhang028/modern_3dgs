@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import cv2
 import math
+import matplotlib.cm as cm
 from tqdm import tqdm
 from pathlib import Path
 
@@ -26,7 +27,9 @@ def render_visualization(
     output_path: str,
     modes: list,
     selected_cameras: list = None,
-    save_format: str = "mp4"
+    save_format: str = "mp4",
+    start_frame: int = 0,
+    end_frame: int = -1
 ):
     """
     Render visualization videos for selected modes.
@@ -34,10 +37,23 @@ def render_visualization(
     mkdir_p(output_path)
     
     # 1. Prepare Cameras
-    if selected_cameras is None:
-        cameras = dataset
-    else:
-        cameras = [dataset[i] for i in selected_cameras]
+    if not dataset or len(dataset) == 0:
+        print("Error: No frames found in dataset.")
+        return
+        
+    # sort by time
+    sorted_indices = sorted(range(len(dataset)), key=lambda i: getattr(dataset.cameras[i], 'timestamp', 0.0) if hasattr(dataset, 'cameras') else i)
+    
+    # Extract Camera objects from dataset
+    extracted_cameras = []
+    for i in sorted_indices:
+        item = dataset[i]
+        cam_obj = item["camera"] if isinstance(item, dict) else item
+        extracted_cameras.append(cam_obj)
+
+    # Since dataset is already filtered by DataConfig configs,
+    # all extracted_cameras belong to the selected cameras and frame ranges.
+    cameras = extracted_cameras
 
     print(f"Rendering {len(cameras)} cameras for modes: {modes}")
 
@@ -66,10 +82,14 @@ def render_visualization(
     # Render Loop
     for cam_idx, camera in enumerate(tqdm(cameras, desc="Rendering Frames")):
         
+        # Ensure camera is on GPU
+        import copy
+        camera = copy.copy(camera)
+        camera.to("cuda")
+        
         # Determine timestamp
-        # For FreeTimeGS, camera usually has 'time' attribute.
-        # If not, use normalized time from camera index if appropriate, or 0.
-        timestamp = getattr(camera, 'time', 0.0)
+        # For FreeTimeGS, camera usually has 'timestamp' or 'time' attribute.
+        timestamp = getattr(camera, 'timestamp', getattr(camera, 'time', 0.0))
         
         # Put camera and bg on GPU
         bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
@@ -104,10 +124,11 @@ def render_visualization(
                              t_scale_log = torch.zeros((model.num_points, 1), device="cuda") - 10.0 # Small duration
                         
                         duration = torch.exp(t_scale_log)
-                        # Normalize: red=long (>0.5), blue=short
                         heatmap = torch.clamp(duration / 0.5, 0.0, 1.0)
-                        # Red=Long, Blue=Short.
-                        colors_override = torch.cat([heatmap, torch.zeros_like(heatmap), 1.0 - heatmap], dim=1)
+                        
+                        heatmap_np = heatmap.detach().cpu().numpy().squeeze()
+                        plasma_colors = cm.plasma(heatmap_np)[:, :3]
+                        colors_override = torch.tensor(plasma_colors, dtype=torch.float32, device="cuda")
                     except:
                         colors_override = torch.zeros((model.num_points, 3), device="cuda")
 
@@ -115,8 +136,9 @@ def render_visualization(
                     # Visualization 3: Time Center
                     if hasattr(model, 'get_t'):
                         mu_t = model.get_t # [N, 1]
-                        colors_override = torch.cat([mu_t, 1.0 - mu_t, torch.zeros_like(mu_t)], dim=1)
-                        colors_override = torch.clamp(colors_override, 0.0, 1.0)
+                        heatmap_np = mu_t.detach().cpu().numpy().squeeze()
+                        plasma_colors = cm.plasma(heatmap_np)[:, :3]
+                        colors_override = torch.tensor(plasma_colors, dtype=torch.float32, device="cuda")
                     else:
                         colors_override = torch.zeros((model.num_points, 3), device="cuda")
 
@@ -124,9 +146,11 @@ def render_visualization(
                     # Visualization 4: Spatial Scale Heatmap
                     scales = model.get_scaling # [N, 3]
                     avg_scale = torch.mean(scales, dim=1, keepdim=True)
-                    # Normalize: Red=Large (>0.01), Blue=Small
                     norm_scale = torch.clamp(avg_scale / 0.01, 0.0, 1.0)
-                    colors_override = norm_scale.repeat(1, 3) 
+                    
+                    heatmap_np = norm_scale.detach().cpu().numpy().squeeze()
+                    plasma_colors = cm.plasma(heatmap_np)[:, :3]
+                    colors_override = torch.tensor(plasma_colors, dtype=torch.float32, device="cuda")
 
                 elif mode == 'rgb':
                     colors_override = None 
@@ -159,6 +183,13 @@ def render_visualization(
                     image_name = getattr(camera, 'image_name', f"{cam_idx:05d}")
                     cv2.imwrite(os.path.join(output_path, mode, f"{image_name}.png"), image_np)
 
+        # Free memory to prevent OOM
+        camera.image = None
+        camera.alpha_mask = None
+        camera.depth_map = None
+        camera.depth_mask = None
+        del camera
+        
     # Clean up
     if save_format == "mp4":
         for mode, writer in video_writers.items():
@@ -177,14 +208,28 @@ if __name__ == "__main__":
                         help="Visualize modes")
     parser.add_argument("--camera_indices", type=str, default="all", help="all or 0,1,2")
     parser.add_argument("--save_format", type=str, default="mp4", choices=["mp4", "images"], help="Output format: mp4 or images")
+    parser.add_argument("--start_frame", type=int, default=0, help="Start frame index")
+    parser.add_argument("--end_frame", type=int, default=-1, help="End frame index (inclusive), -1 means to the end")
     
     args, _ = parser.parse_known_args()
     
+    if args.camera_indices == "all":
+        selected_cameras = None
+    else:
+        selected_cameras = [i.strip() for i in args.camera_indices.split(",")]
+        
     # 1. Setup Data Config
     data_config = DataConfig(
         source_path=args.source_path,
         model_path=args.model_path,
-        eval=True
+        eval=True,
+        inference_only=True,
+        test_cameras=selected_cameras if selected_cameras is not None else [],
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
+        use_tmp=False,
+        cache_images=False,
+        lazy_loading=True
     )
     
     print("Loading Dataset...")
@@ -238,11 +283,6 @@ if __name__ == "__main__":
     
     # 4. Run Visualization
     modes_list = [m.strip() for m in args.modes.split(",")]
-    
-    if args.camera_indices == "all":
-        selected_cameras = None
-    else:
-        selected_cameras = [int(i) for i in args.camera_indices.split(",")]
         
     render_visualization(
         model, 
@@ -251,5 +291,7 @@ if __name__ == "__main__":
         args.output_path, 
         modes_list,
         selected_cameras,
-        args.save_format
+        args.save_format,
+        args.start_frame,
+        args.end_frame
     )
