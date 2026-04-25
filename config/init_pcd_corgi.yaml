@@ -1,13 +1,13 @@
 # Configuration for SelfCap PCD initialization
 
 # Base Paths (Required)
-source_path: "J:\\Jupyter-Semi\\3DGS_test_data\\bar-release"
-output_path: "J:\\Jupyter-Semi\\3DGS_test_data\\bar-release\\points3d.ply"
+source_path: "J:\\Jupyter-Semi\\3DGS_test_data\\corgi-release"
+output_path: "J:\\Jupyter-Semi\\3DGS_test_data\\corgi-release\\points3d.ply"
 pcd_subfolder: "pcds"
 
 # Frame Processing Range
-start_frame: 3420
-# end_frame: 
+start_frame: 2950
+end_frame: 3010
 downsample_rate: 1
 fps: 60.0
 

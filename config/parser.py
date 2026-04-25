@@ -168,8 +168,8 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
     
     # Keys shared between DensificationConfig and OptimConfig
     shared_densify_keys = [
-        'percent_dense', 'densify_from_iter', 'densify_until_iter', 
-        'densify_interval', 'densify_grad_threshold', 'opacity_reset_interval'
+        'percent_dense', 'densify_from_iter', 'densify_until_iter',
+        'densify_interval', 'densify_grad_threshold', 'densify_grad_threshold_final', 'opacity_reset_interval', 'opacity_reset_until_iter'
     ]
     for k in shared_densify_keys:
         if k in densify_dict:
@@ -209,10 +209,12 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         depth_l1_weight_init=optim_config.depth_l1_weight_init,
         depth_l1_weight_final=optim_config.depth_l1_weight_final,
         densify_grad_threshold=optim_config.densify_grad_threshold,
+        densify_grad_threshold_final=getattr(optim_config, 'densify_grad_threshold_final', 0.0003),
         densify_from_iter=optim_config.densify_from_iter,
         densify_until_iter=optim_config.densify_until_iter,
         densify_interval=getattr(optim_config, 'densify_interval', getattr(optim_config, 'densification_interval', 100)),
         opacity_reset_interval=optim_config.opacity_reset_interval,
+        opacity_reset_until_iter=getattr(optim_config, 'opacity_reset_until_iter', 15000),
         prune_opacity_threshold=densify_dict.get('prune_opacity_threshold', 0.005),
         prune_size_threshold=densify_dict.get('prune_size_threshold', 20.0),
         enable_tensorboard=not args.disable_tensorboard,

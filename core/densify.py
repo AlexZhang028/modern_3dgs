@@ -118,7 +118,18 @@ class GaussianDensifier:
         # Find Gaussians to clone
         # Condition: High gradient AND small size
         device = self.model.device
-        selected_pts_mask = (torch.norm(grads, dim=-1) >= grad_threshold).to(device)
+        
+        # --- Motion-Guided Densification ---
+        if hasattr(self.model, 'get_motion') and self.model.get_motion is not None:
+            velocities = self.model.get_motion
+            speed = torch.norm(velocities, dim=-1)
+            # Shield against NaN velocities which would poison the threshold and block all cloning
+            speed = torch.nan_to_num(speed, nan=0.0)
+            speed_factor = torch.clamp(speed / 2.0, 0.0, 1.0)
+            dynamic_threshold = grad_threshold * (1.0 - 0.75 * speed_factor)
+            selected_pts_mask = (torch.norm(grads, dim=-1) >= dynamic_threshold).to(device)
+        else:
+            selected_pts_mask = (torch.norm(grads, dim=-1) >= grad_threshold).to(device)
         
         # Get Gaussian sizes (max scale in 3D space)
         scales = self.model.get_scaling
@@ -161,7 +172,17 @@ class GaussianDensifier:
         padded_grad = torch.zeros((n_init_points), device=device)
         padded_grad[:grads.shape[0]] = grads.squeeze()
         
-        selected_pts_mask = (padded_grad >= grad_threshold)
+        # --- Motion-Guided Densification ---
+        if hasattr(self.model, 'get_motion') and self.model.get_motion is not None:
+            velocities = self.model.get_motion
+            speed = torch.norm(velocities, dim=-1)
+            # Shield against NaN velocities which would poison the threshold and block all splitting
+            speed = torch.nan_to_num(speed, nan=0.0)
+            speed_factor = torch.clamp(speed / 2.0, 0.0, 1.0)
+            dynamic_threshold = grad_threshold * (1.0 - 0.75 * speed_factor)
+            selected_pts_mask = (padded_grad >= dynamic_threshold).to(device)
+        else:
+            selected_pts_mask = (padded_grad >= grad_threshold).to(device)
         
         scales = self.model.get_scaling
         selected_pts_mask = torch.logical_and(
@@ -209,7 +230,7 @@ class GaussianDensifier:
         # Remove original Gaussians (that have been split)
         prune_filter = torch.cat([
             selected_pts_mask,
-            torch.zeros(N * selected_pts_mask.sum(), dtype=bool, device=device)
+            torch.zeros(N * int(selected_pts_mask.sum().item()), dtype=torch.bool, device=device)
         ])
         self._prune_points(prune_filter)
         
@@ -287,7 +308,7 @@ class GaussianDensifier:
             self.densify_and_split(grads, max_grad, extent, self.config.N_split)
         
         # Prune
-        if iteration >= self.config.prune_from_iter:
+        if iteration >= self.config.prune_from_iter and iteration <= self.config.densify_until_iter:
             # Prune low opacity Gaussians
             self.prune_low_opacity(min_opacity)
             

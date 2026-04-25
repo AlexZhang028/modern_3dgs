@@ -134,7 +134,9 @@ class OptimConfig:
     densify_interval: int = 100
     densification_interval: int = 100  # Alias
     densify_grad_threshold: float = 0.0002
+    densify_grad_threshold_final: float = 0.0003
     opacity_reset_interval: int = 3000
+    opacity_reset_until_iter: int = 15_000
     
     # Optimizer Type
     optimizer_type: str = "default"  # "default" or "sparse_adam"
@@ -153,9 +155,8 @@ class DensificationConfig:
     densify_from_iter: int = 500
     densify_until_iter: int = 15_000
     densify_interval: int = 100
-    
-    # Densification Thresholds
     densify_grad_threshold: float = 0.0002
+    densify_grad_threshold_final: float = 0.0003
     percent_dense: float = 0.01
     N_split: int = 2
     
@@ -170,6 +171,7 @@ class DensificationConfig:
     
     # Opacity Reset
     opacity_reset_interval: int = 3000
+    opacity_reset_until_iter: int = 15_000
     
     # Scene Extent
     cameras_extent: float = 1.0
@@ -236,10 +238,12 @@ class TrainerConfig:
     
     # Densification Parameters (For Trainer context)
     densify_grad_threshold: float = 0.0002
+    densify_grad_threshold_final: float = 0.0003
     densify_from_iter: int = 500
     densify_until_iter: int = 15_000
     densify_interval: int = 100
     opacity_reset_interval: int = 3000
+    opacity_reset_until_iter: int = 15_000
     prune_opacity_threshold: float = 0.005
     prune_size_threshold: float = 20.0
     

@@ -191,11 +191,11 @@ class GaussianOptimizer:
                 if stored_state is not None:
                     stored_state["exp_avg"] = torch.zeros_like(tensor)
                     stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-                    
+
                     del self.optimizer.state[group['params'][0]]
                     group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
                     self.optimizer.state[group['params'][0]] = stored_state
-                    
+
                     optimizable_tensors[group["name"]] = group["params"][0]
                 else:
                     group["params"][0] = nn.Parameter(tensor.requires_grad_(True))

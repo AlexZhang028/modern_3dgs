@@ -376,7 +376,7 @@ def render_preview_dynamic(
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     
     with torch.no_grad():
-        out = renderer(gaussians, camera, bg_color, timestamp=time_val, enable_culling=False) # Disable culling to get accurate visibility stats for dynamic models
+        out = renderer(gaussians, camera, bg_color, timestamp=time_val, enable_culling=True) # Disable culling to get accurate visibility stats for dynamic models
     
     torch.cuda.synchronize()
     render_time_ms = (time.time() - start_time) * 1000

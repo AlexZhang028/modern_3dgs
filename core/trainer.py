@@ -399,14 +399,32 @@ class Trainer:
                 # Relocation Hook
                 self._post_backward_hook(iteration, rendered, target, camera, timestamp)
 
+                # --- Strategy 3: Annealing Threshold ---
+                opacity_reset_until = getattr(self.config, 'opacity_reset_until_iter', 15000)
+                densify_until = self.config.densify_until_iter
+                base_grad = self.config.densify_grad_threshold
+                final_grad = getattr(self.config, 'densify_grad_threshold_final', 0.0003)
+                
+                current_grad_threshold = base_grad
+                if iteration > opacity_reset_until and densify_until > opacity_reset_until:
+                    progress = min((iteration - opacity_reset_until) / float(densify_until - opacity_reset_until), 1.0)
+                    current_grad_threshold = base_grad + progress * (final_grad - base_grad)
+
+                # --- Strategy 2: Staggered Execution ---
+                just_decayed = (iteration % getattr(self.config, 'opacity_reset_interval', 3000) == 0)
+
                 # Standard Densify and Prune
-                if iteration > self.config.densify_from_iter and iteration % self.config.densify_interval == 0:
-                    size_threshold = 20 if iteration > self.config.opacity_reset_interval else None
-                    
+                if iteration > getattr(self.config, 'densify_from_iter', 500) and iteration <= self.config.densify_until_iter and iteration % getattr(self.config, 'densify_interval', 100) == 0:
+                    size_threshold = 20 if iteration > getattr(self.config, 'opacity_reset_interval', 3000) else None
+
+                    # Fix: Densify and prune BEFORE opacity decay/reset in this trigger iteration.
+                    # Without this, we skip the densification completely at trigger steps (like 3000, 6000), 
+                    # and immediately clear stats below, which permanently deletes 100 steps of gradient accumulation 
+                    # exactly when it is most mature.
                     self.densifier.densify_and_prune(
                         iteration=iteration,
-                        max_grad=self.config.densify_grad_threshold,
-                        min_opacity=self.config.prune_opacity_threshold,
+                        max_grad=current_grad_threshold,
+                        min_opacity=getattr(self.config, 'prune_opacity_threshold', 0.005),
                         extent=self.scene_extent,
                         max_screen_size=size_threshold
                     )
@@ -416,9 +434,13 @@ class Trainer:
                         torch.cuda.empty_cache()
                 
                 # Opacity Reset
-                if iteration % self.config.opacity_reset_interval == 0 or \
-                   (self.config.white_background and iteration == self.config.densify_from_iter):
-                    self._reset_opacity()
+                if iteration <= self.config.densify_until_iter:
+                    if just_decayed or \
+                       (self.config.white_background and iteration == self.config.densify_from_iter):
+                        self._reset_opacity(iteration)
+                        # Fix: Reset densification stats immediately after opacity reset 
+                        # to ensure the next 100 steps track fresh post-reset gradients correctly.
+                        self.densifier.reset_stats()
         
         # 9. Optimizer Step
         if iteration < self.config.iterations:
@@ -466,18 +488,43 @@ class Trainer:
 
 
     
-    def _reset_opacity(self):
+    def _reset_opacity(self, iteration: int = 0):
         """
-        Reset opacity of Gaussians.
+        Modified Opacity Reset:
+        - Hard reset (0.01) in the early stage.
+        - Target soft decay (x0.95) in the late stage to clean up floaters.
         """
-        # Calculate new values (Logit space)
-        opacities_new = utils.inverse_sigmoid(torch.min(self.model.get_opacity, torch.ones_like(self.model.get_opacity)*0.01))
+        current_opacity = self.model.get_opacity
         
-        # Update Optimizer and Get New Parameter
-        optimizable_tensors = self.optimizer.replace_tensor_to_optimizer(opacities_new, "opacity")
-        
-        # Update Model
-        self.model._opacity = optimizable_tensors["opacity"]
+        if iteration <= getattr(self.config, 'opacity_reset_until_iter', 15000):
+            target_opacity = torch.min(current_opacity, torch.ones_like(current_opacity) * 0.05)
+            opacities_new = utils.inverse_sigmoid(target_opacity)
+            
+            # For hard reset, we must throw away the entire tensor state and reset Adam momentum
+            optimizable_tensors = self.optimizer.replace_tensor_to_optimizer(opacities_new, "opacity")
+            self.model._opacity = optimizable_tensors["opacity"]
+        else:
+            is_semi_transparent = (current_opacity < 0.5)
+            
+            # Lower bound protection to stop mass pruning of border-line fogs
+            above_prune_safe = (current_opacity > 0.015)
+            
+            if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
+                duration = torch.exp(self.model._t_scale)
+                is_static_mask = (duration > 0.5)
+                target_mask = is_static_mask & is_semi_transparent & above_prune_safe
+            else:
+                target_mask = is_semi_transparent & above_prune_safe
+                
+            decay_mask = target_mask.squeeze(-1)
+            if decay_mask.any():
+                # For soft decay, perform strictly in-place modification.
+                # If we use replace_tensor_to_optimizer, Adam's exp_avg_sq is wiped to 0.
+                # This causes the effective learning rate to shoot back up to lr=0.025,
+                # propelling borderline points directly below 0.005 and triggering mass pruning.
+                with torch.no_grad():
+                    decayed_opacity = current_opacity[decay_mask] * 0.95
+                    self.model._opacity.data[decay_mask] = utils.inverse_sigmoid(decayed_opacity)
         
         # print(f"Opacity Reset Done.")
 
@@ -770,7 +817,7 @@ class FreeTimeTrainer(Trainer):
 
     def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
         # Periodic Relocation
-        if iteration > self.config.densify_from_iter and \
+        if iteration > self.config.densify_from_iter and iteration <= getattr(self.config, 'densify_until_iter', 15000) and \
            iteration % self.config.relocation_interval == 0:
             self._relocate_gaussians(iteration, rendered, target, camera, timestamp)
 
@@ -830,10 +877,10 @@ class FreeTimeTrainer(Trainer):
         new_xyz = receptor_pos + noise
         
         # Get receptor velocity for inheritance
-        receptor_motion = self.model.get_motion[receptor_indices]
-        # Add small velocity perturbation (e.g. 10% of velocity magnitude or fixed small value)
-        motion_noise = (torch.rand_like(receptor_motion) - 0.5) * 0.2 * torch.norm(receptor_motion, dim=1, keepdim=True).clamp(min=1e-3)
-        new_motion = receptor_motion + motion_noise
+        inherited_velocity = self.model.get_motion[receptor_indices]
+        # Add small velocity perturbation
+        noise = torch.randn_like(inherited_velocity) * 0.05
+        new_motion = inherited_velocity + noise
         
         # Apply strict mask limit if n_receptors < num_prune
         active_indices = torch.nonzero(prune_mask).squeeze()
@@ -861,5 +908,11 @@ class FreeTimeTrainer(Trainer):
         super()._log_metrics(iteration, metrics)
         if self.writer:
             self.writer.add_histogram('params/t_scale_log', self.model._t_scale, iteration)
+            if hasattr(self.model, '_motion') and self.model._motion is not None:
+                # Calculate speed (norm of velocity) to track distribution and help tune the 2.0 denominator
+                speed = torch.norm(self.model._motion, dim=-1)
+                self.writer.add_histogram('params/velocity_norm', speed, iteration)
+                self.writer.add_scalar('stats/speed_max', speed.max().item(), iteration)
+                self.writer.add_scalar('stats/speed_mean', speed.mean().item(), iteration)
 
 
