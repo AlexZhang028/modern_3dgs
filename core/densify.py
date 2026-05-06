@@ -121,15 +121,17 @@ class GaussianDensifier:
         
         # --- Motion-Guided Densification ---
         if hasattr(self.model, 'get_motion') and self.model.get_motion is not None:
-            velocities = self.model.get_motion
+            # Selection is a control policy, not a differentiable training target.
+            # Detach explicitly to prevent accidental gradient coupling in future refactors.
+            velocities = self.model.get_motion.detach()
             speed = torch.norm(velocities, dim=-1)
             # Shield against NaN velocities which would poison the threshold and block all cloning
             speed = torch.nan_to_num(speed, nan=0.0)
             speed_factor = torch.clamp(speed / 2.0, 0.0, 1.0)
             dynamic_threshold = grad_threshold * (1.0 - 0.75 * speed_factor)
-            selected_pts_mask = (torch.norm(grads, dim=-1) >= dynamic_threshold).to(device)
+            selected_pts_mask = (torch.norm(grads.detach(), dim=-1) >= dynamic_threshold).to(device)
         else:
-            selected_pts_mask = (torch.norm(grads, dim=-1) >= grad_threshold).to(device)
+            selected_pts_mask = (torch.norm(grads.detach(), dim=-1) >= grad_threshold).to(device)
         
         # Get Gaussian sizes (max scale in 3D space)
         scales = self.model.get_scaling
@@ -174,15 +176,17 @@ class GaussianDensifier:
         
         # --- Motion-Guided Densification ---
         if hasattr(self.model, 'get_motion') and self.model.get_motion is not None:
-            velocities = self.model.get_motion
+            # Selection is a control policy, not a differentiable training target.
+            # Detach explicitly to prevent accidental gradient coupling in future refactors.
+            velocities = self.model.get_motion.detach()
             speed = torch.norm(velocities, dim=-1)
             # Shield against NaN velocities which would poison the threshold and block all splitting
             speed = torch.nan_to_num(speed, nan=0.0)
             speed_factor = torch.clamp(speed / 2.0, 0.0, 1.0)
             dynamic_threshold = grad_threshold * (1.0 - 0.75 * speed_factor)
-            selected_pts_mask = (padded_grad >= dynamic_threshold).to(device)
+            selected_pts_mask = (padded_grad.detach() >= dynamic_threshold).to(device)
         else:
-            selected_pts_mask = (padded_grad >= grad_threshold).to(device)
+            selected_pts_mask = (padded_grad.detach() >= grad_threshold).to(device)
         
         scales = self.model.get_scaling
         selected_pts_mask = torch.logical_and(
