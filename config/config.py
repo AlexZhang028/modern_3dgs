@@ -257,6 +257,16 @@ class TrainerConfig:
     lambda_reg: float = 0.01       # 4D Regularization weight
     relocation_interval: int = 500 # Iteration interval for relocation
 
+    # Dynamic region focus weighting (FreeTimeGS)
+    dynamic_weighting_enabled: bool = False
+    dynamic_boost_start_iter: int = 15000
+    dynamic_boost_end_iter: int = 20000
+    max_dynamic_boost: float = 5.0
+    dynamic_boost_curve_power: float = 3.0
+    dynamic_duration_static: float = 0.5
+    dynamic_duration_dynamic: float = 0.1
+    dynamic_mask_threshold: float = 0.5
+
 # ============================================================================
 # Full Training Configuration
 # ============================================================================

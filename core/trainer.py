@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from config.config import TrainerConfig, DataConfig
 from utils.image_utils import psnr
 import utils.general_utils as utils
-from core.loss import l1_loss, ssim, GaussianLoss
+from core.loss import l1_loss, ssim, fast_ssim, GaussianLoss
 from core.densify import GaussianDensifier, DensificationConfig
 from data.samplers import DataSampler, StaticSampler, TemporalSampler
 from utils.general_utils import inverse_sigmoid
@@ -275,14 +275,105 @@ class Trainer:
         
         # 6. Compute Loss
         target = camera.image.cuda()
+        pred_img = rendered['render']
+
+        # Dynamic region focus weighting schedule (FreeTimeGS only)
+        use_dynamic_weighting = (
+            getattr(self.config, 'dynamic_weighting_enabled', False)
+            and hasattr(self.model, '_t_scale') and self.model._t_scale is not None
+        )
+        if use_dynamic_weighting:
+            boost_start_iter = getattr(self.config, 'dynamic_boost_start_iter', 15000)
+            boost_end_iter = getattr(self.config, 'dynamic_boost_end_iter', 20000)
+            max_dynamic_boost = getattr(self.config, 'max_dynamic_boost', 5.0)
+            curve_power = max(getattr(self.config, 'dynamic_boost_curve_power', 3.0), 1e-6)
+
+            if iteration < boost_start_iter:
+                current_boost = 0.0
+            elif iteration < boost_end_iter and boost_end_iter > boost_start_iter:
+                progress = (iteration - boost_start_iter) / float(boost_end_iter - boost_start_iter)
+                exp_scale = math.exp(curve_power)
+                eased_progress = (math.exp(curve_power * progress) - 1.0) / (exp_scale - 1.0)
+                current_boost = max_dynamic_boost * eased_progress
+            else:
+                current_boost = max_dynamic_boost
+        else:
+            current_boost = 0.0
+
+        dynamic_map_mean = 0.0
+        dynamic_map_max = 0.0
+        dynamic_multiplier_mean = 1.0
+        dynamic_multiplier_max = 1.0
+        pixel_loss_multiplier: torch.Tensor | float = 1.0
+        if current_boost > 0:
+            with torch.no_grad():
+                duration = self.model.get_t_scale.detach()
+                static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
+                dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
+                denom = max(static_dur - dynamic_dur, 1e-6)
+
+                # 0.0 for static points, 1.0 for highly dynamic points
+                dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+                override_colors = dynamic_score.repeat(1, 3)
+
+            with torch.no_grad():
+                weight_render_out = self.renderer(
+                    gaussians=self.model,
+                    camera=camera,
+                    bg_color=torch.zeros(3, device="cuda"),
+                    timestamp=timestamp,
+                    enable_culling=False,
+                    colors_override=override_colors,
+                )
+
+                dynamic_weight_map = weight_render_out['render'][0:1, :, :]
+                pixel_loss_multiplier = 1.0 + current_boost * dynamic_weight_map.detach()
+                dynamic_map_mean = dynamic_weight_map.mean().item()
+                dynamic_map_max = dynamic_weight_map.max().item()
+                dynamic_multiplier_mean = pixel_loss_multiplier.mean().item()
+                dynamic_multiplier_max = pixel_loss_multiplier.max().item()
+
+            del weight_render_out
+            del dynamic_weight_map
 
         # Handle Alpha Mask (Mask out background if necessary)
         if hasattr(camera, 'alpha_mask') and camera.alpha_mask is not None:
              alpha_mask = camera.alpha_mask.cuda()
-             rendered['render'] = rendered['render'] * alpha_mask
+             pred_img = pred_img * alpha_mask
+             if isinstance(pixel_loss_multiplier, torch.Tensor):
+                 pixel_loss_multiplier = pixel_loss_multiplier * alpha_mask
 
-        loss_components = self.loss_fn.get_components(rendered['render'], target)
-        loss = loss_components['total']
+        # Base loss components
+        if self.loss_fn.use_fused_ssim:
+            ssim_val = fast_ssim(pred_img, target)
+        else:
+            ssim_val = ssim(pred_img, target)
+
+        base_l1_val = l1_loss(pred_img, target)
+        if isinstance(pixel_loss_multiplier, torch.Tensor):
+            l1_diff_per_pixel = torch.abs(pred_img - target)
+            weighted_l1_diff = l1_diff_per_pixel * pixel_loss_multiplier
+            l1_loss_val = weighted_l1_diff.mean()
+        else:
+            l1_loss_val = base_l1_val
+
+        loss = (1.0 - self.config.lambda_dssim) * l1_loss_val + self.config.lambda_dssim * (1.0 - ssim_val)
+
+        lpips_metric = 0.0
+        if self.config.lambda_lpips > 0 and self.loss_fn.lpips_model is not None:
+            pred_norm = pred_img * 2.0 - 1.0
+            target_norm = target * 2.0 - 1.0
+            lpips_tensor = self.loss_fn.lpips_model(pred_norm.unsqueeze(0), target_norm.unsqueeze(0)).mean()
+            loss = loss + self.config.lambda_lpips * lpips_tensor
+            lpips_metric = lpips_tensor.item()
+
+        loss_components = {
+            'total': loss,
+            'l1_base': base_l1_val,
+            'l1': l1_loss_val,
+            'ssim': ssim_val,
+            'lpips': lpips_metric,
+        }
         
         # Loss Hook
         loss = self._compute_loss_hook(loss, rendered, iteration)
@@ -428,10 +519,6 @@ class Trainer:
                         extent=self.scene_extent,
                         max_screen_size=size_threshold
                     )
-                    
-                    # Periodic garbage collection for VRAM fragmentation
-                    if iteration % (self.config.densify_interval * 5) == 0:
-                        torch.cuda.empty_cache()
                 
                 # Opacity Reset
                 if iteration <= self.config.densify_until_iter:
@@ -441,6 +528,11 @@ class Trainer:
                         # Fix: Reset densification stats immediately after opacity reset 
                         # to ensure the next 100 steps track fresh post-reset gradients correctly.
                         self.densifier.reset_stats()
+        
+        # Periodic garbage collection for VRAM fragmentation 
+        # (Moved outside densify block to prevent OOM/slowdowns from dynamic weighting double-renders after 30k)
+        if iteration % (getattr(self.config, 'densify_interval', 100) * 5) == 0:
+            torch.cuda.empty_cache()
         
         # 9. Optimizer Step
         if iteration < self.config.iterations:
@@ -452,7 +544,12 @@ class Trainer:
             'loss': loss.item(),
             'l1': loss_components['l1'].item(),
             'ssim': loss_components['ssim'].item(),
-            'num_gaussians': self.model.num_points
+            'num_gaussians': self.model.num_points,
+            'dynamic_boost': current_boost,
+            'dynamic_map_mean': dynamic_map_mean,
+            'dynamic_map_max': dynamic_map_max,
+            'dynamic_multiplier_mean': dynamic_multiplier_mean,
+            'dynamic_multiplier_max': dynamic_multiplier_max,
         }
         if 'lpips' in loss_components:
              val = loss_components['lpips']
@@ -486,6 +583,26 @@ class Trainer:
             self.model.active_sh_degree = new_degree
             print(f"\nSH degree increased to: {new_degree}/{max_sh_degree}")
 
+    def _compute_masked_psnr(self, prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> Optional[float]:
+        """Compute PSNR over a masked region."""
+        if mask is None:
+            return None
+
+        mask = mask.float()
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.shape != prediction.shape:
+            mask = mask.expand_as(prediction)
+
+        if mask.sum().item() <= 0:
+            return None
+
+        mse = ((prediction - target) ** 2 * mask).sum() / mask.sum().clamp_min(1.0)
+        if mse <= 0:
+            return float('inf')
+
+        return 20.0 * torch.log10(torch.tensor(1.0, device=prediction.device) / torch.sqrt(mse)).item()
+
 
     
     def _reset_opacity(self, iteration: int = 0):
@@ -510,7 +627,7 @@ class Trainer:
             above_prune_safe = (current_opacity > 0.015)
             
             if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                duration = torch.exp(self.model._t_scale)
+                duration = self.model.get_t_scale
                 is_static_mask = (duration > 0.5)
                 target_mask = is_static_mask & is_semi_transparent & above_prune_safe
             else:
@@ -552,6 +669,8 @@ class Trainer:
         # TensorBoard
         if self.writer:
             self.writer.add_scalar('Loss/total', metrics['loss'], iteration)
+            if 'l1_base' in metrics:
+                self.writer.add_scalar('Loss/l1_base', metrics['l1_base'], iteration)
             self.writer.add_scalar('Loss/l1', metrics['l1'], iteration)
             self.writer.add_scalar('Loss/ssim', metrics['ssim'], iteration)
             if 'lpips' in metrics:
@@ -562,6 +681,16 @@ class Trainer:
             self.writer.add_scalar('Stats/sh_degree', self.current_sh_degree, iteration)
             self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
             self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
+            if 'dynamic_boost' in metrics:
+                self.writer.add_scalar('DynamicWeight/boost', metrics['dynamic_boost'], iteration)
+            if 'dynamic_map_mean' in metrics:
+                self.writer.add_scalar('DynamicWeight/map_mean', metrics['dynamic_map_mean'], iteration)
+            if 'dynamic_map_max' in metrics:
+                self.writer.add_scalar('DynamicWeight/map_max', metrics['dynamic_map_max'], iteration)
+            if 'dynamic_multiplier_mean' in metrics:
+                self.writer.add_scalar('DynamicWeight/multiplier_mean', metrics['dynamic_multiplier_mean'], iteration)
+            if 'dynamic_multiplier_max' in metrics:
+                self.writer.add_scalar('DynamicWeight/multiplier_max', metrics['dynamic_multiplier_max'], iteration)
         
         # History
         self.stats['loss_history'].append(metrics['loss'])
@@ -588,6 +717,8 @@ class Trainer:
         psnr_list = []
         l1_list = []
         ssim_list = []
+        masked_psnr_dynamic_list = []
+        masked_psnr_static_list = []
         
         print(f"   Evaluating {prefix} set ({len(indices)} images)...")
         
@@ -618,6 +749,55 @@ class Trainer:
                 l1_list.append(l1)
                 psnr_list.append(psnr_val)
                 ssim_list.append(ssim_val)
+
+                dynamic_weight_map = None
+                masked_psnr_dynamic = None
+                masked_psnr_static = None
+
+                use_masked_psnr = (
+                    getattr(self.config, 'dynamic_weighting_enabled', False)
+                    and iteration >= getattr(self.config, 'dynamic_boost_start_iter', 15000)
+                    and hasattr(self.model, '_t_scale') and self.model._t_scale is not None
+                )
+
+                if use_masked_psnr:
+                    with torch.no_grad():
+                        duration = self.model.get_t_scale.detach()
+                        static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
+                        dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
+                        denom = max(static_dur - dynamic_dur, 1e-6)
+
+                        dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+                        override_colors = dynamic_score.repeat(1, 3)
+
+                        weight_render_out = self.renderer(
+                            gaussians=self.model,
+                            camera=camera,
+                            bg_color=torch.zeros(3, device="cuda"),
+                            timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
+                            enable_culling=False,
+                            colors_override=override_colors,
+                        )
+
+                        dynamic_weight_map = weight_render_out['render'][0:1, :, :].detach().clamp(0.0, 1.0)
+                        del weight_render_out
+
+                    dynamic_mask_threshold = getattr(self.config, 'dynamic_mask_threshold', 0.5)
+                    dynamic_mask = (dynamic_weight_map >= dynamic_mask_threshold).float()
+                    valid_mask = None
+                    if hasattr(camera, 'alpha_mask') and camera.alpha_mask is not None:
+                        valid_mask = camera.alpha_mask.cuda()[0:1]
+                        dynamic_mask = dynamic_mask * valid_mask
+                        static_mask = (1.0 - dynamic_mask) * valid_mask
+                    else:
+                        static_mask = 1.0 - dynamic_mask
+
+                    masked_psnr_dynamic = self._compute_masked_psnr(prediction, target, dynamic_mask)
+                    masked_psnr_static = self._compute_masked_psnr(prediction, target, static_mask)
+                    if masked_psnr_dynamic is not None:
+                        masked_psnr_dynamic_list.append(masked_psnr_dynamic)
+                    if masked_psnr_static is not None:
+                        masked_psnr_static_list.append(masked_psnr_static)
                 
                 # TensorBoard Images
                 if self.writer:
@@ -627,6 +807,46 @@ class Trainer:
                     
                     # Render result on every log
                     self.writer.add_image(f'{prefix}_Render/{camera.image_name}', prediction, iteration)
+
+                    # Dynamic weight heatmap (if enabled)
+                    if getattr(self.config, 'dynamic_weighting_enabled', False) and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
+                        with torch.no_grad():
+                            duration = self.model.get_t_scale.detach()
+                            static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
+                            dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
+                            denom = max(static_dur - dynamic_dur, 1e-6)
+
+                            # 0.0 static, 1.0 dynamic
+                            dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+                            override_colors = dynamic_score.repeat(1, 3)
+
+                            weight_render_out = self.renderer(
+                                gaussians=self.model,
+                                camera=camera,
+                                bg_color=torch.zeros(3, device="cuda"),
+                                timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
+                                enable_culling=False,
+                                colors_override=override_colors
+                            )
+
+                            # Single-channel weight map -> colorize for TensorBoard
+                            dynamic_weight_map = weight_render_out['render'][0:1, :, :].detach().clamp(0.0, 1.0)
+
+                            # Convert to RGB using matplotlib colormap
+                            try:
+                                import matplotlib.cm as cm
+                                import numpy as np
+
+                                w_np = dynamic_weight_map.squeeze(0).cpu().numpy()
+                                cmap = cm.get_cmap('plasma')
+                                rgba = cmap(w_np)[:, :, :3]
+                                rgb = torch.from_numpy(rgba).permute(2, 0, 1).to(dtype=torch.float32)
+                                self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', rgb, iteration)
+                            except Exception:
+                                # Fallback: log single-channel as grayscale
+                                self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', dynamic_weight_map, iteration)
+
+                            del weight_render_out
 
                     # 5. Gradient Contribution Map
                     with torch.enable_grad():
@@ -686,19 +906,44 @@ class Trainer:
                         )
                         self.writer.add_image(f'{prefix}_GradMap/{camera.image_name}', rendered_vis['render'].clamp(0.0, 1.0), iteration)
 
+                    if dynamic_weight_map is not None:
+                        try:
+                            import matplotlib.cm as cm
+
+                            w_np = dynamic_weight_map.squeeze(0).cpu().numpy()
+                            cmap = cm.get_cmap('plasma')
+                            rgba = cmap(w_np)[:, :, :3]
+                            rgb = torch.from_numpy(rgba).permute(2, 0, 1).to(dtype=torch.float32)
+                            self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', rgb, iteration)
+                        except Exception:
+                            self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', dynamic_weight_map, iteration)
+
 
         
         # Compute Averages
         avg_l1 = torch.tensor(l1_list).mean().item()
         avg_psnr = torch.tensor(psnr_list).mean().item()
         avg_ssim = torch.tensor(ssim_list).mean().item()
+
+        avg_masked_psnr_dynamic = torch.tensor(masked_psnr_dynamic_list).mean().item() if masked_psnr_dynamic_list else None
+        avg_masked_psnr_static = torch.tensor(masked_psnr_static_list).mean().item() if masked_psnr_static_list else None
         
-        print(f"   {prefix} Results - L1: {avg_l1:.4f} | PSNR: {avg_psnr:.4f} | SSIM: {avg_ssim:.4f}")
+        if avg_masked_psnr_dynamic is not None and avg_masked_psnr_static is not None:
+            print(
+                f"   {prefix} Results - L1: {avg_l1:.4f} | PSNR: {avg_psnr:.4f} | SSIM: {avg_ssim:.4f} | "
+                f"MaskedDynPSNR: {avg_masked_psnr_dynamic:.4f} | MaskedStaPSNR: {avg_masked_psnr_static:.4f}"
+            )
+        else:
+            print(f"   {prefix} Results - L1: {avg_l1:.4f} | PSNR: {avg_psnr:.4f} | SSIM: {avg_ssim:.4f}")
         
         if self.writer:
             self.writer.add_scalar(f'{prefix}/l1', avg_l1, iteration)
             self.writer.add_scalar(f'{prefix}/psnr', avg_psnr, iteration)
             self.writer.add_scalar(f'{prefix}/ssim', avg_ssim, iteration)
+            if avg_masked_psnr_dynamic is not None:
+                self.writer.add_scalar(f'{prefix}/masked_psnr_dynamic', avg_masked_psnr_dynamic, iteration)
+            if avg_masked_psnr_static is not None:
+                self.writer.add_scalar(f'{prefix}/masked_psnr_static', avg_masked_psnr_static, iteration)
 
     
     def save_checkpoint(self, iteration: int, final: bool = False):

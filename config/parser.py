@@ -232,6 +232,16 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         lambda_reg=trainer_dict.get('lambda_reg', 0.01),
 
         relocation_interval=trainer_dict.get('relocation_interval', 500),
+
+        # Dynamic region focus weighting
+        dynamic_weighting_enabled=trainer_dict.get('dynamic_weighting_enabled', False),
+        dynamic_boost_start_iter=trainer_dict.get('dynamic_boost_start_iter', 15000),
+        dynamic_boost_end_iter=trainer_dict.get('dynamic_boost_end_iter', 20000),
+        max_dynamic_boost=trainer_dict.get('max_dynamic_boost', 5.0),
+        dynamic_boost_curve_power=trainer_dict.get('dynamic_boost_curve_power', 3.0),
+        dynamic_duration_static=trainer_dict.get('dynamic_duration_static', 0.5),
+        dynamic_duration_dynamic=trainer_dict.get('dynamic_duration_dynamic', 0.1),
+        dynamic_mask_threshold=trainer_dict.get('dynamic_mask_threshold', 0.5),
     )
     
     return data_config, model_config, optim_config, pipeline_config, trainer_config, config_dict
