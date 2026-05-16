@@ -22,6 +22,8 @@ dependencies:
     - scipy
     - pillow
     - lpips
+    - scikit-learn
+    - matplotlib
     # - diff-gaussian-rasterization  # Requires submodule
     # - simple-knn                   # Requires submodule
 

@@ -60,6 +60,8 @@ trainer:
   dynamic_weighting_enabled: true
   dynamic_boost_start_iter: 15000
   dynamic_boost_end_iter: 30000
+  # How often (in iterations) to update per-view dynamic weight cache
+  dynamic_weight_cache_update_interval: 10000
   max_dynamic_boost: 10.0
   dynamic_boost_curve_power: 3.0
   dynamic_duration_static: 0.5

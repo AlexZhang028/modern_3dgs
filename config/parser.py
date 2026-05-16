@@ -230,8 +230,10 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         
         # FreeTimeGS Specific
         lambda_reg=trainer_dict.get('lambda_reg', 0.01),
-
         relocation_interval=trainer_dict.get('relocation_interval', 500),
+        motion_blur_start_iter=trainer_dict.get('motion_blur_start_iter', 15000),
+        lambda_motion_blur=trainer_dict.get('lambda_motion_blur', 0.05),
+        motion_blur_speed_threshold=trainer_dict.get('motion_blur_speed_threshold', 0.5),
 
         # Dynamic region focus weighting
         dynamic_weighting_enabled=trainer_dict.get('dynamic_weighting_enabled', False),

@@ -96,19 +96,10 @@ def main():
     # Renderer
     renderer = setup_renderer(pipeline_config).cuda()
     
-    # 3. Resume (Optional)
-    start_iteration = 0
-    if args.resume_from and Path(args.resume_from).exists():
-        print(f"\nResuming from checkpoint: {args.resume_from}")
-        try:
-            checkpoint = torch.load(args.resume_from)
-            model.load_state_dict(checkpoint['model'])
-            optimizer.optimizer.load_state_dict(checkpoint['optimizer'])
-            start_iteration = checkpoint.get('iteration', 0)
-            print(f"   Resuming at iteration: {start_iteration}")
-        except Exception as e:
-            print(f"   Error loading checkpoint: {e}")
-            print("   Starting from scratch.")
+    # 3. Resume path (optional) - actual loading happens after Trainer is initialized
+    resume_path = None
+    if args.resume_from:
+        resume_path = args.resume_from
     
     if args.test_only:
         print("\nTest Mode Only")
@@ -137,10 +128,22 @@ def main():
         test_dataset=test_dataset
     )
     
-    # Fix for resume functionality: explicitly update trainer's iteration
-    if start_iteration > 0:
-        trainer.current_iteration = start_iteration
-        print(f"   Trainer iteration updated to: {trainer.current_iteration}")
+    # If a resume checkpoint was provided, load it via Trainer API (supports current checkpoint format)
+    if resume_path and Path(resume_path).exists():
+        try:
+            trainer.load_checkpoint(resume_path)
+        except Exception as e:
+            print(f"   Warning: failed to load checkpoint via Trainer.load_checkpoint: {e}")
+            print("   Attempting legacy resume (best-effort)")
+            try:
+                ck = torch.load(resume_path)
+                if 'model_state_dict' in ck and 'optimizer_state_dict' in ck:
+                    trainer.model.load_state_dict(ck['model_state_dict'])
+                    trainer.optimizer.load_state_dict(ck['optimizer_state_dict'])
+                    trainer.current_iteration = ck.get('iteration', trainer.current_iteration)
+                    print(f"   Legacy checkpoint loaded, resuming at iter {trainer.current_iteration}")
+            except Exception as e2:
+                print(f"   Legacy resume failed: {e2}. Starting from scratch.")
 
     try:
         trainer.train()

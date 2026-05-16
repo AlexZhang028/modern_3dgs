@@ -150,6 +150,8 @@ class Trainer:
             self.test_view_indices = self._select_fixed_views(len(test_dataset))
         
         self.logged_gt = False
+        # Cache for per-view dynamic weight maps: {view_id: {'map': Tensor, 'iter': int}}
+        self.dynamic_weight_cache = {}
 
     def _select_fixed_views(self, num_total_views: int) -> List[int]:
         """Select fixed indices for test views."""
@@ -241,22 +243,48 @@ class Trainer:
         Returns:
             metrics: Dictionary containing loss and other metrics.
         """
+        timing = {
+            'sample_ms': 0.0,
+            'lr_sh_ms': 0.0,
+            'camera_to_cuda_ms': 0.0,
+            'render_ms': 0.0,
+            'dynamic_weight_render_ms': 0.0,
+            'loss_ms': 0.0,
+            'loss_hook_ms': 0.0,
+            'depth_reg_ms': 0.0,
+            'backward_ms': 0.0,
+            'stats_update_ms': 0.0,
+            'post_backward_ms': 0.0,
+            'densify_prune_ms': 0.0,
+            'opacity_reset_ms': 0.0,
+            'adaptive_control_ms': 0.0,
+            'empty_cache_ms': 0.0,
+            'optimizer_step_ms': 0.0,
+        }
+
+        step_start = time.perf_counter()
         # 3. Sample Data
+        t0 = time.perf_counter()
         camera, timestamp = self.sampler.sample()
+        timing['sample_ms'] = (time.perf_counter() - t0) * 1000.0
 
         # 1. Update Learning Rate
         # Must be done AFTER sampling time - Fixed: Velocity LR uses iteration now
+        t0 = time.perf_counter()
         self.optimizer.update_learning_rate(iteration)
         
         # 2. Update SH Degree
         self._update_sh_degree(iteration)
+        timing['lr_sh_ms'] = (time.perf_counter() - t0) * 1000.0
         
         # Ensure camera data is on GPU (safe for multiprocessing)
         # This handles both images and transformation matrices
         # IMPORTANT: Use copy to avoid modifying persistent dataset objects when using 0 workers
         import copy
+        t0 = time.perf_counter()
         camera = copy.copy(camera)
         camera.to("cuda")
+        timing['camera_to_cuda_ms'] = (time.perf_counter() - t0) * 1000.0
         
         # 4. Random Background (Optional)
         if self.config.random_background:
@@ -265,6 +293,7 @@ class Trainer:
             bg_color = self.bg_color
         
         # 5. Render
+        t0 = time.perf_counter()
         rendered = self.renderer(
             gaussians=self.model,
             camera=camera,
@@ -272,8 +301,10 @@ class Trainer:
             timestamp=timestamp,
             enable_culling=False  # Disable culling for stable training and proper densification stats
         )
+        timing['render_ms'] = (time.perf_counter() - t0) * 1000.0
         
         # 6. Compute Loss
+        t0 = time.perf_counter()
         target = camera.image.cuda()
         pred_img = rendered['render']
 
@@ -306,35 +337,77 @@ class Trainer:
         dynamic_multiplier_max = 1.0
         pixel_loss_multiplier: torch.Tensor | float = 1.0
         if current_boost > 0:
-            with torch.no_grad():
-                duration = self.model.get_t_scale.detach()
-                static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
-                dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
-                denom = max(static_dur - dynamic_dur, 1e-6)
+            t_weight = time.perf_counter()
+            # Per-view caching: avoid re-rendering dynamic weight every step.
+            # Cache is updated every `dynamic_weight_cache_update_interval` iterations (default 10000).
+            cache_interval = getattr(self.config, 'dynamic_weight_cache_update_interval', 10000)
+            view_id = getattr(camera, 'image_name', None)
+            # Fallback to index-based key if image_name missing
+            if view_id is None:
+                view_id = f"view_{getattr(camera, 'index', '0')}"
 
-                # 0.0 for static points, 1.0 for highly dynamic points
-                dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
-                override_colors = dynamic_score.repeat(1, 3)
+            need_update = True
+            cached_entry = self.dynamic_weight_cache.get(view_id, None)
+            if cached_entry is not None:
+                last_iter = cached_entry.get('iter', -1)
+                if (iteration - last_iter) < cache_interval:
+                    need_update = False
 
-            with torch.no_grad():
-                weight_render_out = self.renderer(
-                    gaussians=self.model,
-                    camera=camera,
-                    bg_color=torch.zeros(3, device="cuda"),
-                    timestamp=timestamp,
-                    enable_culling=False,
-                    colors_override=override_colors,
-                )
+            cache_hit = 0.0
+            if need_update:
+                with torch.no_grad():
+                    duration = self.model.get_t_scale.detach()
+                    static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
+                    dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
+                    denom = max(static_dur - dynamic_dur, 1e-6)
 
-                dynamic_weight_map = weight_render_out['render'][0:1, :, :]
-                pixel_loss_multiplier = 1.0 + current_boost * dynamic_weight_map.detach()
-                dynamic_map_mean = dynamic_weight_map.mean().item()
-                dynamic_map_max = dynamic_weight_map.max().item()
+                    # 0.0 for static points, 1.0 for highly dynamic points
+                    dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+                    override_colors = dynamic_score.repeat(1, 3)
+
+                with torch.no_grad():
+                    weight_render_out = self.renderer(
+                        gaussians=self.model,
+                        camera=camera,
+                        bg_color=torch.zeros(3, device="cuda"),
+                        timestamp=timestamp,
+                        enable_culling=False,
+                        colors_override=override_colors,
+                    )
+
+                    dynamic_weight_map = weight_render_out['render'][0:1, :, :]
+                    # Store a CPU copy to avoid holding extra GPU memory between updates
+                    dyn_cpu = dynamic_weight_map.detach().cpu()
+                    self.dynamic_weight_cache[view_id] = {'map': dyn_cpu, 'iter': iteration}
+
+                    pixel_loss_multiplier = 1.0 + current_boost * dyn_cpu.cuda()
+                    dynamic_map_mean = dyn_cpu.mean().item()
+                    dynamic_map_max = dyn_cpu.max().item()
+                    dynamic_multiplier_mean = pixel_loss_multiplier.mean().item()
+                    dynamic_multiplier_max = pixel_loss_multiplier.max().item()
+
+                del weight_render_out
+                del dynamic_weight_map
+                timing['dynamic_weight_render_ms'] = (time.perf_counter() - t_weight) * 1000.0
+                cache_hit = 0.0
+            else:
+                # Use cached map (move to GPU temporarily)
+                t_cache = time.perf_counter()
+                dyn_cpu = cached_entry['map']
+                pixel_loss_multiplier = 1.0 + current_boost * dyn_cpu.cuda()
+                dynamic_map_mean = float(dyn_cpu.mean())
+                dynamic_map_max = float(dyn_cpu.max())
                 dynamic_multiplier_mean = pixel_loss_multiplier.mean().item()
                 dynamic_multiplier_max = pixel_loss_multiplier.max().item()
+                timing['dynamic_weight_render_ms'] = (time.perf_counter() - t_cache) * 1000.0
+                cache_hit = 1.0
 
-            del weight_render_out
-            del dynamic_weight_map
+            # Log cache hit metric to TensorBoard (if available)
+            if hasattr(self, 'writer') and self.writer is not None:
+                try:
+                    self.writer.add_scalar('DynamicWeight/cache_hit', float(cache_hit), iteration)
+                except Exception:
+                    pass
 
         # Handle Alpha Mask (Mask out background if necessary)
         if hasattr(camera, 'alpha_mask') and camera.alpha_mask is not None:
@@ -374,12 +447,16 @@ class Trainer:
             'ssim': ssim_val,
             'lpips': lpips_metric,
         }
+        timing['loss_ms'] = (time.perf_counter() - t0) * 1000.0
         
         # Loss Hook
+        t0 = time.perf_counter()
         loss = self._compute_loss_hook(loss, rendered, iteration)
+        timing['loss_hook_ms'] = (time.perf_counter() - t0) * 1000.0
 
         # Depth regularization (if available)
         Ll1depth_pure = 0.0
+        t0 = time.perf_counter()
         if hasattr(camera, 'depth_map') and camera.depth_map is not None and camera.depth_reliable:
             weight = self.depth_l1_weight(iteration)
             if weight > 0:
@@ -389,12 +466,32 @@ class Trainer:
                 
                 Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).mean()
                 loss += weight * Ll1depth_pure
+        timing['depth_reg_ms'] = (time.perf_counter() - t0) * 1000.0
         
-        # 7. Backward Pass
+        # 7. Backward Pass (fine-grained timing)
+        t_bw_total_start = time.perf_counter()
+        # sync before backward to capture any pending CUDA work
+        torch.cuda.synchronize()
+        t_sync_before = time.perf_counter()
+        timing['backward_sync_before_ms'] = (t_sync_before - t_bw_total_start) * 1000.0
+
+        # actual autograd compute
+        t_bw_compute_start = time.perf_counter()
         loss.backward()
+        t_bw_compute_end = time.perf_counter()
+        timing['backward_compute_ms'] = (t_bw_compute_end - t_bw_compute_start) * 1000.0
+
+        # sync after backward to ensure kernels finished
+        torch.cuda.synchronize()
+        t_sync_after = time.perf_counter()
+        timing['backward_sync_after_ms'] = (t_sync_after - t_bw_compute_end) * 1000.0
+
+        # total backward time (preserves existing metric)
+        timing['backward_ms'] = (t_sync_after - t_bw_total_start) * 1000.0
 
         # 8. Adaptive Control (Densification, Pruning, Relocation)
         with torch.no_grad():
+            t_block = time.perf_counter()
             if iteration < self.config.densify_until_iter:
                 # Accumulate stats
                 # Handle FreeTimeGS Culled rendering:
@@ -406,6 +503,7 @@ class Trainer:
                 # This breaks the 1:1 mapping needed for update_stats.
                 
                 # Check if we have culled mask
+                t_stats = time.perf_counter()
                 if 'culled_mask' in rendered and rendered['culled_mask'] is not None:
                      culled_mask = rendered['culled_mask']
                      
@@ -486,9 +584,12 @@ class Trainer:
                         visibility_filter=rendered['visibility_filter'],
                         radii=rendered['radii']
                     )
+                timing['stats_update_ms'] = (time.perf_counter() - t_stats) * 1000.0
                 
                 # Relocation Hook
+                t_post = time.perf_counter()
                 self._post_backward_hook(iteration, rendered, target, camera, timestamp)
+                timing['post_backward_ms'] = (time.perf_counter() - t_post) * 1000.0
 
                 # --- Strategy 3: Annealing Threshold ---
                 opacity_reset_until = getattr(self.config, 'opacity_reset_until_iter', 15000)
@@ -512,6 +613,7 @@ class Trainer:
                     # Without this, we skip the densification completely at trigger steps (like 3000, 6000), 
                     # and immediately clear stats below, which permanently deletes 100 steps of gradient accumulation 
                     # exactly when it is most mature.
+                    t_densify = time.perf_counter()
                     self.densifier.densify_and_prune(
                         iteration=iteration,
                         max_grad=current_grad_threshold,
@@ -519,25 +621,33 @@ class Trainer:
                         extent=self.scene_extent,
                         max_screen_size=size_threshold
                     )
+                    timing['densify_prune_ms'] = (time.perf_counter() - t_densify) * 1000.0
                 
                 # Opacity Reset
                 if iteration <= self.config.densify_until_iter:
                     if just_decayed or \
                        (self.config.white_background and iteration == self.config.densify_from_iter):
+                        t_reset = time.perf_counter()
                         self._reset_opacity(iteration)
                         # Fix: Reset densification stats immediately after opacity reset 
                         # to ensure the next 100 steps track fresh post-reset gradients correctly.
                         self.densifier.reset_stats()
+                        timing['opacity_reset_ms'] = (time.perf_counter() - t_reset) * 1000.0
+            timing['adaptive_control_ms'] = (time.perf_counter() - t_block) * 1000.0
         
         # Periodic garbage collection for VRAM fragmentation 
         # (Moved outside densify block to prevent OOM/slowdowns from dynamic weighting double-renders after 30k)
         if iteration % (getattr(self.config, 'densify_interval', 100) * 5) == 0:
+            t_cache = time.perf_counter()
             torch.cuda.empty_cache()
+            timing['empty_cache_ms'] = (time.perf_counter() - t_cache) * 1000.0
         
         # 9. Optimizer Step
         if iteration < self.config.iterations:
+            t_step = time.perf_counter()
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
+            timing['optimizer_step_ms'] = (time.perf_counter() - t_step) * 1000.0
         
         # Metrics
         metrics = {
@@ -554,6 +664,9 @@ class Trainer:
         if 'lpips' in loss_components:
              val = loss_components['lpips']
              metrics['lpips'] = val.item() if hasattr(val, 'item') else val
+
+        metrics.update(timing)
+        metrics['iteration_time'] = (time.perf_counter() - step_start) * 1000.0
 
         # Explicit cleanup to allow GC to reclaim graph immediately
         del rendered
@@ -681,6 +794,30 @@ class Trainer:
             self.writer.add_scalar('Stats/sh_degree', self.current_sh_degree, iteration)
             self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
             self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
+            timing_keys = [
+                'sample_ms',
+                'lr_sh_ms',
+                'camera_to_cuda_ms',
+                'render_ms',
+                'dynamic_weight_render_ms',
+                'loss_ms',
+                'loss_hook_ms',
+                'depth_reg_ms',
+                'backward_ms',
+                'backward_sync_before_ms',
+                'backward_compute_ms',
+                'backward_sync_after_ms',
+                'stats_update_ms',
+                'post_backward_ms',
+                'densify_prune_ms',
+                'opacity_reset_ms',
+                'adaptive_control_ms',
+                'empty_cache_ms',
+                'optimizer_step_ms',
+            ]
+            for key in timing_keys:
+                if key in metrics:
+                    self.writer.add_scalar(f'Timing/{key}', metrics[key], iteration)
             if 'dynamic_boost' in metrics:
                 self.writer.add_scalar('DynamicWeight/boost', metrics['dynamic_boost'], iteration)
             if 'dynamic_map_mean' in metrics:
@@ -1057,6 +1194,16 @@ class FreeTimeTrainer(Trainer):
         # else:
         l_reg = (base_opacity * temporal_weight.detach()).mean()
         loss += reg_weight * l_reg
+
+        if iteration > getattr(self.config, 'motion_blur_start_iter', 15000) and hasattr(self.model, '_motion') and self.model._motion is not None:
+            speed = torch.norm(self.model._motion, dim=-1).detach()
+            duration = torch.exp(self.model._t_scale).squeeze(-1)
+            fast_mask = speed > getattr(self.config, 'motion_blur_speed_threshold', 0.5)
+
+            if fast_mask.any():
+                lambda_motion_blur = getattr(self.config, 'lambda_motion_blur', 0.05)
+                motion_blur_loss = (speed[fast_mask] * duration[fast_mask]).mean()
+                loss += lambda_motion_blur * motion_blur_loss
             
         return loss
 

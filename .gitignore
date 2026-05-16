@@ -28,3 +28,4 @@ ENV/
 
 *.mp4
 visualization/
+out/

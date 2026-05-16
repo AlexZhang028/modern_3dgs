@@ -127,8 +127,10 @@ class GaussianDensifier:
             speed = torch.norm(velocities, dim=-1)
             # Shield against NaN velocities which would poison the threshold and block all cloning
             speed = torch.nan_to_num(speed, nan=0.0)
-            speed_factor = torch.clamp(speed / 2.0, 0.0, 1.0)
-            dynamic_threshold = grad_threshold * (1.0 - 0.75 * speed_factor)
+            velocity_normalizer = getattr(self.config, 'velocity_normalizer', 2.0)
+            speed_factor = torch.clamp(speed / velocity_normalizer, 0.0, 1.0)
+            clone_coeff = getattr(self.config, 'clone_speed_shrink_coeff', 0.75)
+            dynamic_threshold = grad_threshold * (1.0 - clone_coeff * speed_factor)
             selected_pts_mask = (torch.norm(grads.detach(), dim=-1) >= dynamic_threshold).to(device)
         else:
             selected_pts_mask = (torch.norm(grads.detach(), dim=-1) >= grad_threshold).to(device)
@@ -182,16 +184,29 @@ class GaussianDensifier:
             speed = torch.norm(velocities, dim=-1)
             # Shield against NaN velocities which would poison the threshold and block all splitting
             speed = torch.nan_to_num(speed, nan=0.0)
-            speed_factor = torch.clamp(speed / 2.0, 0.0, 1.0)
-            dynamic_threshold = grad_threshold * (1.0 - 0.75 * speed_factor)
+            velocity_normalizer = getattr(self.config, 'velocity_normalizer', 2.0)
+            speed_factor = torch.clamp(speed / velocity_normalizer, 0.0, 1.0)
+            clone_coeff = getattr(self.config, 'clone_speed_shrink_coeff', 0.75)
+            dynamic_threshold = grad_threshold * (1.0 - clone_coeff * speed_factor)
             selected_pts_mask = (padded_grad.detach() >= dynamic_threshold).to(device)
         else:
             selected_pts_mask = (padded_grad.detach() >= grad_threshold).to(device)
         
         scales = self.model.get_scaling
+        base_size_threshold = self.config.percent_dense * scene_extent
+        if hasattr(self.model, '_motion') and self.model._motion is not None:
+            velocities = self.model._motion.detach()
+            speed = torch.nan_to_num(torch.norm(velocities, dim=-1), nan=0.0)
+            velocity_normalizer = getattr(self.config, 'velocity_normalizer', 2.0)
+            scale_shrink_multiplier = getattr(self.config, 'scale_shrink_multiplier', 2.0)
+            speed_factor = torch.clamp(speed / velocity_normalizer, 0.0, 1.0)
+            dynamic_size_threshold = base_size_threshold / (1.0 + scale_shrink_multiplier * speed_factor)
+        else:
+            dynamic_size_threshold = base_size_threshold
+
         selected_pts_mask = torch.logical_and(
             selected_pts_mask,
-            (torch.max(scales, dim=1).values > self.config.percent_dense * scene_extent).to(device)
+            (torch.max(scales, dim=1).values > dynamic_size_threshold).to(device)
         )
         
         # Sample from selected Gaussians
@@ -207,7 +222,8 @@ class GaussianDensifier:
                   self.model.get_xyz[selected_pts_mask].repeat(N, 1)
         
         # Shrink scale (split Gaussians should be smaller)
-        split_scaling = self.model.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)
+        split_shrink_base = getattr(self.config, 'split_scale_shrink_base', 0.8)
+        split_scaling = self.model.get_scaling[selected_pts_mask].repeat(N, 1) / (split_shrink_base * N)
         new_scaling = torch.log(split_scaling)
         
         # Copy other attributes

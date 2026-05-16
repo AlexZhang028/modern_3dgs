@@ -1,0 +1,97 @@
+data:
+  cache_images: false
+  data_device: cuda
+  end_frame: 3010
+  eval: false
+  images: images
+  init_point_cloud_path: ''
+  lazy_loading: true
+  model_path: J:\Jupyter-Semi\FreeTimeGS_res\corgi\01_edge_optim
+  normalized_t: false
+  num_workers: 0
+  pin_memory: true
+  resolution: 4
+  source_path: J:\Jupyter-Semi\3DGS_test_data\corgi-release
+  start_frame: 2950
+  test_cameras:
+  - ''
+  train_cameras: null
+  white_background: false
+
+densify:
+  densify_from_iter: 500
+  densify_grad_threshold: 0.0001
+  densify_interval: 100
+  densify_until_iter: 30000
+  densify_grad_threshold_final: 0.0001
+  opacity_reset_until_iter: 11999
+  prune_opacity_threshold: 0.005
+  # Percent of scene extent used as base dense threshold
+  percent_dense: 0.01
+  # Edge optimization: velocity-conditioned scale restriction parameters
+  # Normalizer used to scale speeds into [0,1] for speed_factor = clamp(speed / velocity_normalizer)
+  velocity_normalizer: 2.0
+  # Multiplier controlling how much to shrink allowed scale for fast-moving points
+  scale_shrink_multiplier: 2.0
+  # Minimum allowed dynamic scale divisor (prevents division-by-zero-ish behavior)
+  min_dynamic_scale_denominator: 1e-6
+  # Clone-specific speed shrink coefficient (used in densify_and_clone)
+  clone_speed_shrink_coeff: 0.75
+  # Split-specific base shrink factor (used when computing split_scaling divisor: 0.8 * N_split)
+  split_scale_shrink_base: 0.8
+  # Number of splits per selected gaussian (overrides DensificationConfig.N_split if provided)
+  N_split: 2
+  # Prune timing override
+  prune_from_iter: 500
+
+iterations: 50000
+
+model:
+  mode: freetime
+  percent_dense: 0.01
+  sh_degree: 3
+
+optim:
+  feature_lr: 0.0025
+  iterations: 50000
+  lambda_dssim: 0.2
+  opacity_lr: 0.025
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  t_lr: 0.0001
+  t_scale_lr: 0.005
+  velocity_lr: 0.00016
+  opacity_reset_until_iter: 11999
+
+trainer:
+  lambda_reg: 0.01
+  log_interval: 10
+  relocation_interval: 100
+  save_interval: 5000
+  test_interval: 5000
+  opacity_reset_until_iter: 11999
+
+  # Dynamic region focus weighting
+  dynamic_weighting_enabled: true
+  dynamic_boost_start_iter: 15000
+  dynamic_boost_end_iter: 30000
+  # How often (in iterations) to update per-view dynamic weight cache
+  dynamic_weight_cache_update_interval: 10000
+  max_dynamic_boost: 10.0
+  dynamic_boost_curve_power: 3.0
+  dynamic_duration_static: 0.5
+  dynamic_duration_dynamic: 0.1
+  dynamic_mask_threshold: 0.5
+
+  # Edge optimization: velocity-aware duration penalty (loss hook)
+  velocity_aware_duration_penalty_enabled: true
+  # Start applying the velocity-aware duration penalty after this iteration
+  velocity_penalty_start_iter: 15000
+  # Motion blur penalty start iteration (used by code as motion_blur_start_iter)
+  motion_blur_start_iter: 15000
+  # Lambda weight for the motion-blur penalty term (suggested 0.01-0.05)
+  lambda_motion_blur: 0.05
+  # Speed threshold above which a point is considered "fast" and penalized
+  motion_blur_speed_threshold: 0.5

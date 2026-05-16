@@ -257,6 +257,11 @@ class TrainerConfig:
     lambda_reg: float = 0.01       # 4D Regularization weight
     relocation_interval: int = 500 # Iteration interval for relocation
 
+    # Motion blur suppression (FreeTimeGS)
+    motion_blur_start_iter: int = 15000
+    lambda_motion_blur: float = 0.05
+    motion_blur_speed_threshold: float = 0.5
+
     # Dynamic region focus weighting (FreeTimeGS)
     dynamic_weighting_enabled: bool = False
     dynamic_boost_start_iter: int = 15000
