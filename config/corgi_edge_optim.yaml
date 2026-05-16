@@ -6,12 +6,12 @@ data:
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: J:\Jupyter-Semi\FreeTimeGS_res\corgi\01_edge_optim
+  model_path: ..\FreeTimeGS_res\corgi\01_edge_optim
   normalized_t: false
   num_workers: 0
   pin_memory: true
   resolution: 4
-  source_path: J:\Jupyter-Semi\3DGS_test_data\corgi-release
+  source_path: ..\3DGS_test_data\corgi-release
   start_frame: 2950
   test_cameras:
   - ''
