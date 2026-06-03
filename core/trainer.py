@@ -78,8 +78,9 @@ class Trainer:
             lambda_dssim=config.lambda_dssim,
             lambda_lpips=config.lambda_lpips
         )
+        self.lpips_enabled = config.lambda_lpips > 0 and self.loss_fn.lpips_model is not None
         # Move loss to device (important for LPIPS weights)
-        if config.lambda_lpips > 0:
+        if self.lpips_enabled:
             self.loss_fn = self.loss_fn.cuda()
         
         # Create Densifier
@@ -433,7 +434,7 @@ class Trainer:
         loss = (1.0 - self.config.lambda_dssim) * l1_loss_val + self.config.lambda_dssim * (1.0 - ssim_val)
 
         lpips_metric = 0.0
-        if self.config.lambda_lpips > 0 and self.loss_fn.lpips_model is not None:
+        if self.lpips_enabled:
             pred_norm = pred_img * 2.0 - 1.0
             target_norm = target * 2.0 - 1.0
             lpips_tensor = self.loss_fn.lpips_model(pred_norm.unsqueeze(0), target_norm.unsqueeze(0)).mean()
@@ -792,8 +793,9 @@ class Trainer:
                 self.writer.add_scalar('Stats/iteration_time', metrics['iteration_time'], iteration)
             self.writer.add_scalar('Stats/num_gaussians', metrics['num_gaussians'], iteration)
             self.writer.add_scalar('Stats/sh_degree', self.current_sh_degree, iteration)
-            self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
-            self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
+            if hasattr(self.model, '_t') and self.model._t is not None:
+                self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
+                self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
             timing_keys = [
                 'sample_ms',
                 'lr_sh_ms',
@@ -849,6 +851,22 @@ class Trainer:
         self.logged_gt = True
         self.model.train()
 
+    def _render_for_eval(self, camera, bg_color: torch.Tensor, **kwargs):
+        """Render helper for evaluation with explicit mode separation."""
+        render_kwargs = {
+            'gaussians': self.model,
+            'camera': camera,
+            'bg_color': bg_color,
+            **kwargs,
+        }
+
+        # Only temporal model needs timestamp during evaluation.
+        if self.mode == "freetime":
+            ts = getattr(camera, 'timestamp', None)
+            render_kwargs['timestamp'] = 0.0 if ts is None else ts
+
+        return self.renderer(**render_kwargs)
+
     def _evaluate_set(self, dataset, indices: List[int], prefix: str, iteration: int):
         """Evaluate a specific dataset subset."""
         psnr_list = []
@@ -866,11 +884,9 @@ class Trainer:
                 camera.to("cuda")
                 
                 # Render
-                rendered = self.renderer(
-                    gaussians=self.model,
+                rendered = self._render_for_eval(
                     camera=camera,
                     bg_color=self.bg_color,
-                    timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
                     enable_culling=False
                 )
                 
@@ -907,11 +923,9 @@ class Trainer:
                         dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
                         override_colors = dynamic_score.repeat(1, 3)
 
-                        weight_render_out = self.renderer(
-                            gaussians=self.model,
+                        weight_render_out = self._render_for_eval(
                             camera=camera,
                             bg_color=torch.zeros(3, device="cuda"),
-                            timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
                             enable_culling=False,
                             colors_override=override_colors,
                         )
@@ -957,11 +971,9 @@ class Trainer:
                             dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
                             override_colors = dynamic_score.repeat(1, 3)
 
-                            weight_render_out = self.renderer(
-                                gaussians=self.model,
+                            weight_render_out = self._render_for_eval(
                                 camera=camera,
                                 bg_color=torch.zeros(3, device="cuda"),
-                                timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
                                 enable_culling=False,
                                 colors_override=override_colors
                             )
@@ -987,11 +999,9 @@ class Trainer:
 
                     # 5. Gradient Contribution Map
                     with torch.enable_grad():
-                        rendered_grad = self.renderer(
-                            gaussians=self.model,
+                        rendered_grad = self._render_for_eval(
                             camera=camera,
                             bg_color=self.bg_color,
-                            timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
                             enable_culling=False
                         )
                         pred_grad = rendered_grad['render']
@@ -1033,11 +1043,9 @@ class Trainer:
                         self.model.zero_grad(set_to_none=True)
                     
                     if grad_color is not None:
-                        rendered_vis = self.renderer(
-                            gaussians=self.model,
+                        rendered_vis = self._render_for_eval(
                             camera=camera,
                             bg_color=torch.tensor([0.0, 0.0, 0.0], device="cuda"),
-                            timestamp=camera.timestamp if hasattr(camera, 'timestamp') else 0.0,
                             enable_culling=False,
                             colors_override=grad_color
                         )

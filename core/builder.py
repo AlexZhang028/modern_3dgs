@@ -7,6 +7,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from typing import Optional
+import numbers
 
 from config.config import DataConfig, ModelConfig, OptimConfig, PipelineConfig
 from data.dataset import GaussianDataset, SelfCapVideoDataset, StaticGaussianDataset
@@ -113,21 +114,28 @@ def setup_model(
     
     # Always calculate time stats from dataset if available
     if dataset and hasattr(dataset, "cameras") and len(dataset.cameras) > 0:
-        # Check if cameras have timestamp_seconds (SelfCap datasets)
-        if hasattr(dataset.cameras[0], 'timestamp_seconds'):
-            times = [c.timestamp_seconds for c in dataset.cameras]
-            if times:
-                t_min = min(times)
-                t_max_val = max(times)
-                # t_start is the offset of the video in world time (often 0)
-                t_start = t_min
-                t_extent = t_max_val - t_min
-                
-                # If single frame or very fast, prevent zero division
-                if t_extent < 1e-6:
-                     t_extent = 1.0
-                
-                print(f"   Time Extent: {t_extent:.4f}s (Start: {t_start:.4f}s)")
+        # Static scenes may still expose timestamp fields, but values are often None.
+        # Only keep valid numeric timestamps to avoid min/max errors.
+        times = []
+        for c in dataset.cameras:
+            t = getattr(c, "timestamp_seconds", None)
+            if t is None:
+                t = getattr(c, "timestamp", None)
+            if isinstance(t, numbers.Real):
+                times.append(float(t))
+
+        if times:
+            t_min = min(times)
+            t_max_val = max(times)
+            # t_start is the offset of the video in world time (often 0)
+            t_start = t_min
+            t_extent = t_max_val - t_min
+
+            # If single frame or very fast, prevent zero division
+            if t_extent < 1e-6:
+                t_extent = 1.0
+
+            print(f"   Time Extent: {t_extent:.4f}s (Start: {t_start:.4f}s)")
     
     # If not using normalized time, we still pass the extent so random initialization covers the full range
     if not model_config.normalized_t:
@@ -177,7 +185,10 @@ def setup_model(
                 cameras_extent = camera_centers.std().item() * 3
                 print(f"   Fallback to std*3 extent: {cameras_extent:.6f}")
         
-        model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent, time_info=time_info)
+        if model.mode == "freetime":
+            model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent, time_info=time_info)
+        else:
+            model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent)
     else:
         print("   No initial point cloud found, using random initialization")
         
@@ -211,7 +222,10 @@ def setup_model(
             normals=normals
         )
         
-        model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent, time_info=time_info)
+        if model.mode == "freetime":
+            model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent, time_info=time_info)
+        else:
+            model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent)
     
     print(f"   Initial points: {model.num_points}")
     

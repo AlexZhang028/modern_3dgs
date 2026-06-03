@@ -182,6 +182,7 @@ class GaussianRenderer(nn.Module):
         camera: Camera,
         bg_color: torch.Tensor,
         scaling_modifier: float = 1.0,
+        enable_culling: bool = False,
         colors_override: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
@@ -192,6 +193,7 @@ class GaussianRenderer(nn.Module):
             camera: Camera.
             bg_color: Background color [3] (must be on GPU).
             scaling_modifier: Scale modifier.
+            enable_culling: Kept for API compatibility; ignored in static mode.
             colors_override: Optional color override [N, 3].
             
         Returns:

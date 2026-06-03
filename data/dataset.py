@@ -308,6 +308,11 @@ class GaussianDataset(Dataset):
         else:
             camera.image = resized_image_rgb
             camera.alpha_mask = torch.ones(1, resized_image_rgb.shape[1], resized_image_rgb.shape[2])
+
+        # Keep camera raster size in sync with loaded image size.
+        # This is required when using downscale factors (e.g., resolution=4),
+        # otherwise renderer outputs original size while GT/masks are resized.
+        self._sync_camera_raster_size(camera, camera.image)
         
         # Apply white/black background (for NeRF Synthetic)
         if resized_image_rgb.shape[0] == 4:
@@ -320,6 +325,15 @@ class GaussianDataset(Dataset):
         # Load depth map (if available)
         if hasattr(camera, '_depth_path') and camera._depth_path and os.path.exists(camera._depth_path):
             self._load_depth_map(camera, resolution)
+
+    def _sync_camera_raster_size(self, camera: Camera, image_tensor: torch.Tensor):
+        """Sync camera width/height with image tensor shape for rendering."""
+        h = int(image_tensor.shape[1])
+        w = int(image_tensor.shape[2])
+        if camera.width != w or camera.height != h:
+            camera.width = w
+            camera.height = h
+            camera.compute_transforms()
     
     def _load_depth_map(self, camera: Camera, resolution: Tuple[int, int]):
         """Load depth map."""
@@ -957,6 +971,7 @@ class SelfCapVideoDataset(GaussianDataset):
                          if c._frame_idx == current_frame:
                              c.image = image_tensor
                              c.alpha_mask = torch.ones(1, image_tensor.shape[1], image_tensor.shape[2], device=image_tensor.device)
+                             self._sync_camera_raster_size(c, c.image)
                              
                              # Manually populate cache dict so __getitem__ sees it
                              # Note: caching in `self.image_cache` uses dataset index as key.
@@ -1012,6 +1027,7 @@ class SelfCapVideoDataset(GaussianDataset):
         
         camera.image = image_tensor
         camera.alpha_mask = torch.ones(1, image_tensor.shape[1], image_tensor.shape[2])
+        self._sync_camera_raster_size(camera, camera.image)
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
