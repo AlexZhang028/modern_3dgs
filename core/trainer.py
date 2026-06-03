@@ -490,6 +490,38 @@ class Trainer:
         # total backward time (preserves existing metric)
         timing['backward_ms'] = (t_sync_after - t_bw_total_start) * 1000.0
 
+        # 7.5. Phase-based gradient routing (FreeTimeGS decoupled training)
+        # Phase 2 (joint_end ~ dynamic_end): zero static Gaussian grads -> only dynamic updates
+        # Phase 3 (dynamic_end ~ end):       zero dynamic Gaussian grads -> only static updates
+        if getattr(self.config, 'decouple_training_enabled', False) \
+                and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
+            joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+            dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+            if iteration > joint_end:
+                with torch.no_grad():
+                    dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
+                    duration   = self.model.get_t_scale.squeeze()  # [N], already exp-activated
+                    is_static  = duration > dur_thresh
+                    is_dynamic = ~is_static
+
+                    freeze_mask = is_static if iteration <= dynamic_end else is_dynamic
+
+                    if freeze_mask.any():
+                        # Zero spatial/color/geometry gradients for frozen group
+                        for key in ['xyz', 'features_dc', 'features_rest',
+                                    'opacity', 'scaling', 'rotation']:
+                            p = self.model._gaussian_params.get(key)
+                            if p is not None and p.grad is not None:
+                                p.grad[freeze_mask] = 0.0
+
+                        # Phase 3 (static focus): also freeze temporal params of dynamic Gaussians
+                        # to protect the 4D structure established during Phase 2
+                        if iteration > dynamic_end:
+                            for key in ['t', 't_scale', 'motion']:
+                                p = self.model._gaussian_params.get(key)
+                                if p is not None and p.grad is not None:
+                                    p.grad[freeze_mask] = 0.0
+
         # 8. Adaptive Control (Densification, Pruning, Relocation)
         with torch.no_grad():
             t_block = time.perf_counter()
@@ -586,7 +618,21 @@ class Trainer:
                         radii=rendered['radii']
                     )
                 timing['stats_update_ms'] = (time.perf_counter() - t_stats) * 1000.0
-                
+
+                # Phase-based densification masking: prevent frozen Gaussians from accumulating
+                # densification stats, so they won't be cloned/split during the wrong phase
+                if getattr(self.config, 'decouple_training_enabled', False) \
+                        and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
+                    joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+                    dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+                    if iteration > joint_end:
+                        dur_thresh   = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
+                        duration     = self.model.get_t_scale.squeeze()
+                        freeze_mask  = (duration > dur_thresh) if iteration <= dynamic_end \
+                                       else (duration <= dur_thresh)
+                        self.densifier.xyz_gradient_accum[freeze_mask] = 0.0
+                        self.densifier.denom[freeze_mask] = 0.0
+
                 # Relocation Hook
                 t_post = time.perf_counter()
                 self._post_backward_hook(iteration, rendered, target, camera, timestamp)
@@ -830,7 +876,22 @@ class Trainer:
                 self.writer.add_scalar('DynamicWeight/multiplier_mean', metrics['dynamic_multiplier_mean'], iteration)
             if 'dynamic_multiplier_max' in metrics:
                 self.writer.add_scalar('DynamicWeight/multiplier_max', metrics['dynamic_multiplier_max'], iteration)
-        
+
+            # Phase-based decoupled training: log static/dynamic Gaussian counts
+            if getattr(self.config, 'decouple_training_enabled', False) \
+                    and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
+                with torch.no_grad():
+                    dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
+                    duration   = self.model.get_t_scale.squeeze()
+                    n_static   = int((duration > dur_thresh).sum().item())
+                    n_dynamic  = self.model.num_points - n_static
+                self.writer.add_scalar('Decouple/n_static',  n_static,  iteration)
+                self.writer.add_scalar('Decouple/n_dynamic', n_dynamic, iteration)
+                joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+                dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+                phase = 1 if iteration <= joint_end else (2 if iteration <= dynamic_end else 3)
+                self.writer.add_scalar('Decouple/phase', phase, iteration)
+
         # History
         self.stats['loss_history'].append(metrics['loss'])
         self.stats['gaussian_count'].append(metrics['num_gaussians'])

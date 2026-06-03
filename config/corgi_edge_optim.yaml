@@ -6,12 +6,12 @@ data:
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: ..\FreeTimeGS_res\corgi\01_edge_optim
+  model_path: J:\Jupyter-Semi\FreeTimeGS_res\corgi\01_edge_optim
   normalized_t: false
   num_workers: 0
   pin_memory: true
   resolution: 4
-  source_path: ..\3DGS_test_data\corgi-release
+  source_path: J:\Jupyter-Semi\3DGS_test_data\corgi-release
   start_frame: 2950
   test_cameras:
   - ''
@@ -84,6 +84,15 @@ trainer:
   dynamic_duration_static: 0.5
   dynamic_duration_dynamic: 0.1
   dynamic_mask_threshold: 0.5
+
+  # Phase-based decoupled training
+  # Phase 1 (0-15k):   joint training, establishes static/dynamic separation
+  # Phase 2 (15k-30k): dynamic focus, static Gaussian grads zeroed + dynamic boost active
+  # Phase 3 (30k-50k): static focus,  dynamic Gaussian grads + temporal params zeroed
+  decouple_training_enabled: true
+  decouple_joint_end_iter: 15000
+  decouple_dynamic_end_iter: 30000
+  decouple_static_duration_threshold: 0.5
 
   # Edge optimization: velocity-aware duration penalty (loss hook)
   velocity_aware_duration_penalty_enabled: true

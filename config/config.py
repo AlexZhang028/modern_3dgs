@@ -271,6 +271,16 @@ class TrainerConfig:
     dynamic_duration_static: float = 0.5
     dynamic_duration_dynamic: float = 0.1
     dynamic_mask_threshold: float = 0.5
+    dynamic_weight_cache_update_interval: int = 10000
+
+    # Phase-based decoupled training (FreeTimeGS)
+    # Phase 1 (0 ~ joint_end):          joint training, both static/dynamic updated freely
+    # Phase 2 (joint_end ~ dynamic_end): dynamic focus, static Gaussian grads zeroed
+    # Phase 3 (dynamic_end ~ end):       static focus,  dynamic Gaussian grads zeroed
+    decouple_training_enabled: bool = False
+    decouple_joint_end_iter: int = 15000
+    decouple_dynamic_end_iter: int = 30000
+    decouple_static_duration_threshold: float = 0.5  # exp(t_scale) > threshold -> static
 
 # ============================================================================
 # Full Training Configuration
