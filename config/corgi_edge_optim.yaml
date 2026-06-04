@@ -93,6 +93,8 @@ trainer:
   decouple_joint_end_iter: 15000
   decouple_dynamic_end_iter: 30000
   decouple_static_duration_threshold: 0.5
+  decouple_dynamic_densify_mult: 0.5   # Phase 2: halve grad threshold for dynamic Gaussians
+  decouple_dynamic_n_split: 3          # Phase 2: split each dynamic Gaussian into 3 instead of 2
 
   # Edge optimization: velocity-aware duration penalty (loss hook)
   velocity_aware_duration_penalty_enabled: true

@@ -281,6 +281,9 @@ class TrainerConfig:
     decouple_joint_end_iter: int = 15000
     decouple_dynamic_end_iter: int = 30000
     decouple_static_duration_threshold: float = 0.5  # exp(t_scale) > threshold -> static
+    # Phase 2 densification: lower threshold and higher N_split for dynamic Gaussians
+    decouple_dynamic_densify_mult: float = 0.5   # grad threshold multiplier in Phase 2
+    decouple_dynamic_n_split: int = 3             # N_split override for dynamic Gaussians in Phase 2
 
 # ============================================================================
 # Full Training Configuration

@@ -302,30 +302,34 @@ class GaussianDensifier:
         max_grad: float,
         min_opacity: float,
         extent: float,
-        max_screen_size: Optional[float]
+        max_screen_size: Optional[float],
+        n_split_override: Optional[int] = None,
     ):
         """
         Main Densify and Prune process.
-        
+
         Args:
             iteration: Current iteration number.
             max_grad: Gradient threshold.
             min_opacity: Minimum opacity.
             extent: Scene extent.
             max_screen_size: Maximum screen size (None for no size pruning).
+            n_split_override: If set, overrides config.N_split for this call.
         """
         # Calculate average gradients
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
-        
+
+        n_split = n_split_override if n_split_override is not None else self.config.N_split
+
         # Densify
         if iteration >= self.config.densify_from_iter and \
            iteration <= self.config.densify_until_iter:
             # Clone small Gaussians
             self.densify_and_clone(grads, max_grad, extent)
-            
+
             # Split large Gaussians
-            self.densify_and_split(grads, max_grad, extent, self.config.N_split)
+            self.densify_and_split(grads, max_grad, extent, n_split)
         
         # Prune
         if iteration >= self.config.prune_from_iter and iteration <= self.config.densify_until_iter:

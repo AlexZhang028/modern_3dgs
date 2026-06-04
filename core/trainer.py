@@ -657,16 +657,31 @@ class Trainer:
                     size_threshold = 20 if iteration > getattr(self.config, 'opacity_reset_interval', 3000) else None
 
                     # Fix: Densify and prune BEFORE opacity decay/reset in this trigger iteration.
-                    # Without this, we skip the densification completely at trigger steps (like 3000, 6000), 
-                    # and immediately clear stats below, which permanently deletes 100 steps of gradient accumulation 
+                    # Without this, we skip the densification completely at trigger steps (like 3000, 6000),
+                    # and immediately clear stats below, which permanently deletes 100 steps of gradient accumulation
                     # exactly when it is most mature.
+
+                    # Phase 2 dynamic densification boost:
+                    # In Phase 2 static Gaussian stats are zeroed, so lowering the threshold only
+                    # affects dynamic Gaussians — no risk of inflating static regions.
+                    effective_grad_threshold = current_grad_threshold
+                    effective_n_split = None  # None -> densifier uses its config default
+                    if getattr(self.config, 'decouple_training_enabled', False):
+                        _joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+                        _dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+                        if _joint_end < iteration <= _dynamic_end:
+                            densify_mult = getattr(self.config, 'decouple_dynamic_densify_mult', 0.5)
+                            effective_grad_threshold = current_grad_threshold * densify_mult
+                            effective_n_split = getattr(self.config, 'decouple_dynamic_n_split', 3)
+
                     t_densify = time.perf_counter()
                     self.densifier.densify_and_prune(
                         iteration=iteration,
-                        max_grad=current_grad_threshold,
+                        max_grad=effective_grad_threshold,
                         min_opacity=getattr(self.config, 'prune_opacity_threshold', 0.005),
                         extent=self.scene_extent,
-                        max_screen_size=size_threshold
+                        max_screen_size=size_threshold,
+                        n_split_override=effective_n_split,
                     )
                     timing['densify_prune_ms'] = (time.perf_counter() - t_densify) * 1000.0
                 
