@@ -154,6 +154,25 @@ class Trainer:
         # Cache for per-view dynamic weight maps: {view_id: {'map': Tensor, 'iter': int}}
         self.dynamic_weight_cache = {}
 
+        # Affine Color Correction (FreeTimeGS++): per-camera scale+bias to absorb
+        # illumination inconsistencies, reducing run-to-run variance (Secret 5).
+        self.cc_enabled = getattr(config, 'color_correction_enabled', False)
+        if self.cc_enabled:
+            self.color_correction = nn.ModuleDict({
+                str(cam.uid): nn.ParameterList([
+                    nn.Parameter(torch.ones(3, device='cuda')),   # scale, init=1
+                    nn.Parameter(torch.zeros(3, device='cuda')),  # bias,  init=0
+                ]) for cam in dataset.cameras
+            })
+            self.cc_optimizer = torch.optim.Adam(
+                self.color_correction.parameters(),
+                lr=getattr(config, 'cc_lr', 0.001)
+            )
+            print(f"Color Correction: enabled for {len(dataset.cameras)} cameras")
+        else:
+            self.color_correction = None
+            self.cc_optimizer = None
+
     def _select_fixed_views(self, num_total_views: int) -> List[int]:
         """Select fixed indices for test views."""
         num_views = self.config.num_test_views
@@ -309,6 +328,13 @@ class Trainer:
         target = camera.image.cuda()
         pred_img = rendered['render']
 
+        # Affine Color Correction: pred = scale * pred + bias (per-camera)
+        if self.cc_enabled and self.color_correction is not None:
+            uid_key = str(camera.uid)
+            if uid_key in self.color_correction:
+                scale, bias = self.color_correction[uid_key]
+                pred_img = pred_img * scale[:, None, None] + bias[:, None, None]
+
         # Dynamic region focus weighting schedule (FreeTimeGS only)
         use_dynamic_weighting = (
             getattr(self.config, 'dynamic_weighting_enabled', False)
@@ -440,6 +466,14 @@ class Trainer:
             lpips_tensor = self.loss_fn.lpips_model(pred_norm.unsqueeze(0), target_norm.unsqueeze(0)).mean()
             loss = loss + self.config.lambda_lpips * lpips_tensor
             lpips_metric = lpips_tensor.item()
+
+        # CC regularization: penalize scale≠1 and bias≠0 to prevent collapse
+        if self.cc_enabled and self.color_correction is not None:
+            uid_key = str(camera.uid)
+            if uid_key in self.color_correction:
+                scale, bias = self.color_correction[uid_key]
+                lambda_cc = getattr(self.config, 'lambda_cc', 0.001)
+                loss = loss + lambda_cc * (((scale - 1.0) ** 2).mean() + (bias ** 2).mean())
 
         loss_components = {
             'total': loss,
@@ -709,6 +743,10 @@ class Trainer:
             t_step = time.perf_counter()
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
+            # Color Correction parameters use a separate Adam optimizer
+            if self.cc_optimizer is not None:
+                self.cc_optimizer.step()
+                self.cc_optimizer.zero_grad(set_to_none=True)
             timing['optimizer_step_ms'] = (time.perf_counter() - t_step) * 1000.0
         
         # Metrics
@@ -1190,6 +1228,10 @@ class Trainer:
                 'config': self.config,
                 'stats': self.stats
             }
+            if self.color_correction is not None:
+                checkpoint['color_correction_state_dict'] = self.color_correction.state_dict()
+            if self.cc_optimizer is not None:
+                checkpoint['cc_optimizer_state_dict'] = self.cc_optimizer.state_dict()
             
             torch.save(checkpoint, checkpoint_path)
             print(f"Checkpoint Saved: {checkpoint_path}")
@@ -1237,6 +1279,10 @@ class Trainer:
         self.current_iteration = checkpoint['iteration']
         self.current_sh_degree = checkpoint['sh_degree']
         self.stats = checkpoint.get('stats', self.stats)
+        if self.color_correction is not None and 'color_correction_state_dict' in checkpoint:
+            self.color_correction.load_state_dict(checkpoint['color_correction_state_dict'])
+        if self.cc_optimizer is not None and 'cc_optimizer_state_dict' in checkpoint:
+            self.cc_optimizer.load_state_dict(checkpoint['cc_optimizer_state_dict'])
         
         print(f"Checkpoint Loaded (iter {self.current_iteration})")
     
@@ -1279,6 +1325,13 @@ class FreeTimeTrainer(Trainer):
         l_reg = (base_opacity * temporal_weight.detach()).mean()
         loss += reg_weight * l_reg
 
+        # FreeTimeGS++ Gate regularization: penalize intermediate gate values (push toward 0 or 1)
+        # g*(1-g) = 0 at extremes, max 0.25 at g=0.5
+        if 'gate' in self.model._gaussian_params:
+            lambda_gate = getattr(self.config, 'lambda_gate', 0.001)
+            gate_val = self.model.get_gate.squeeze()
+            loss += lambda_gate * (gate_val * (1.0 - gate_val)).mean()
+
         if iteration > getattr(self.config, 'motion_blur_start_iter', 15000) and hasattr(self.model, '_motion') and self.model._motion is not None:
             speed = torch.norm(self.model._motion, dim=-1).detach()
             duration = torch.exp(self.model._t_scale).squeeze(-1)
@@ -1299,86 +1352,92 @@ class FreeTimeTrainer(Trainer):
 
     def _relocate_gaussians(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
         """
-        FreeTimeGS Relocation Strategy:
-        Teleport "dead" gaussians (donors) to high-score regions (receptors).
-        Score s = 0.5 * grad + 0.5 * opacity
+        MCMC-style Relocation (FreeTimeGS++, Secret 4).
+        Donors inherit ALL parameters from their receptor (including appearance, temporal
+        params, and gate), with opacity and scale normalized by the number of clones sharing
+        that receptor to prevent opacity accumulation artifacts.
         """
-        # 1. Identify "Donors" (Low Base Opacity)
-        # Using 0.01 threshold as per paper
-        # And ensure we don't prune everything
+        import math
+
+        # 1. Donors: low-opacity Gaussians to recycle
         opac = self.model.get_opacity.squeeze()
-        prune_mask = (opac < 0.01) & (opac >= 0.005) # Only recycle standard victims
-        # If we just pick < 0.01, standard pruning (0.005) might have killed them? 
-        # But this runs usually before pruning or around same time.
-        
+        prune_mask = (opac < 0.01) & (opac >= 0.005)
         num_prune = prune_mask.sum().item()
-        
         if num_prune == 0:
             return
 
-        # 2. Identify "Receptors" (High Sampling Score)
-        # Use Densifier's stats! Model's buffers are often empty if not updated.
-        if self.densifier.denom.sum() == 0: # Safety check
-             return
+        if self.densifier.denom.sum() == 0:
+            return
 
-        # Calculate average gradients
-        # Note: densifier uses self.xyz_gradient_accum
+        # 2. Score receptors: s = 0.5 * normalised_grad + 0.5 * opacity
         grads = self.densifier.xyz_gradient_accum / torch.clamp(self.densifier.denom, min=1e-6)
         grads[grads.isnan()] = 0.0
         grad_norm = torch.norm(grads, dim=-1)
-        
-        # Normalize to combine with opacity
         g_max = grad_norm.max()
-        if g_max > 0: grad_norm /= g_max
-        
+        if g_max > 0:
+            grad_norm = grad_norm / g_max
         score = 0.5 * grad_norm + 0.5 * opac
-        
-        # Mask out donors so we don't relocate to dead zones
         score[prune_mask] = -1.0
-        
-        # Select Top-K receptors
-        n_receptors = min(num_prune, (~prune_mask).sum().item())
-        if n_receptors == 0: return
 
-        top_scores, receptor_indices = torch.topk(score, n_receptors)
-        
-        # 3. Relocate
-        # Move donors to receptors + perturbation
-        receptor_pos = self.model.get_xyz[receptor_indices]
-        receptor_scales = self.model.get_scaling[receptor_indices]
-        
-        # Random perturbation within receptor scale (or small constant)
-        # Using small constant is safer for stability
-        noise = (torch.rand_like(receptor_pos) - 0.5) * 0.01 # +/- 0.005 range
-        new_xyz = receptor_pos + noise
-        
-        # Get receptor velocity for inheritance
-        inherited_velocity = self.model.get_motion[receptor_indices]
-        # Add small velocity perturbation
-        noise = torch.randn_like(inherited_velocity) * 0.05
-        new_motion = inherited_velocity + noise
-        
-        # Apply strict mask limit if n_receptors < num_prune
-        active_indices = torch.nonzero(prune_mask).squeeze()
-        if active_indices.ndim == 0 and num_prune>0: active_indices=active_indices.unsqueeze(0)
-        target_indices = active_indices[:n_receptors]
-        
+        n_relocate = min(num_prune, (~prune_mask).sum().item())
+        if n_relocate == 0:
+            return
+
+        _, receptor_indices = torch.topk(score, n_relocate)  # [n_relocate]
+
+        donor_all = torch.nonzero(prune_mask).squeeze()
+        if donor_all.ndim == 0 and num_prune > 0:
+            donor_all = donor_all.unsqueeze(0)
+        donor_indices = donor_all[:n_relocate]  # [n_relocate]
+
         final_mask = torch.zeros_like(prune_mask)
-        final_mask[target_indices] = True
+        final_mask[donor_indices] = True
 
-        # Apply Relocation (XYZ + Time + Motion)
-        self.model.relocate(final_mask, new_xyz, timestamp, new_motion)
-        
-        # Reset Opacity to 0.01
-        new_opacity = utils.inverse_sigmoid(torch.ones(n_receptors, device="cuda") * 0.01)
+        # 3. MCMC normalization: count donors per receptor for opacity/scale adjustment
+        # Total primitives at each receptor location after relocation = receptor + n_donors
+        # Each donor gets opacity/scale reduced by log(n_total) so total rendering
+        # contribution stays balanced (prevents haze-like artifact accumulation).
+        counts = torch.zeros(self.model.num_points, device='cuda', dtype=torch.float32)
+        counts.scatter_add_(0, receptor_indices, torch.ones(n_relocate, device='cuda'))
+        log_n_total = torch.log((counts[receptor_indices] + 1.0).clamp(min=1.0))  # [n_relocate]
+
         with torch.no_grad():
-            self.model._opacity[final_mask] = new_opacity.unsqueeze(1)
-        
-        # Reset optimizer state for relocated points
-        # Essential to prevent momentum from moving them back or erratically
+            # Position: inherit receptor xyz + small spatial perturbation
+            xyz_noise = (torch.rand(n_relocate, 3, device='cuda') - 0.5) * 0.01
+            self.model._xyz.data[donor_indices] = (
+                self.model._xyz.data[receptor_indices] + xyz_noise
+            )
+
+            # Appearance: full inheritance (prevents dead Gaussian's stale color bleeding)
+            self.model._features_dc.data[donor_indices]   = self.model._features_dc.data[receptor_indices]
+            self.model._features_rest.data[donor_indices] = self.model._features_rest.data[receptor_indices]
+            self.model._rotation.data[donor_indices]      = self.model._rotation.data[receptor_indices]
+
+            # MCMC scale: log_scale -= log(n_total)/3  (preserves total volume)
+            self.model._scaling.data[donor_indices] = (
+                self.model._scaling.data[receptor_indices] - (log_n_total / 3.0).unsqueeze(-1)
+            )
+
+            # MCMC opacity: logit_opacity -= log(n_total)  (preserves total rendered opacity)
+            self.model._opacity.data[donor_indices] = (
+                self.model._opacity.data[receptor_indices] - log_n_total.unsqueeze(-1)
+            )
+
+            # Temporal params: full inheritance (preserves learned time-space structure)
+            if hasattr(self.model, '_t') and self.model._t is not None:
+                self.model._t.data[donor_indices] = self.model._t.data[receptor_indices]
+            if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
+                self.model._t_scale.data[donor_indices] = self.model._t_scale.data[receptor_indices]
+            if hasattr(self.model, '_motion') and self.model._motion is not None:
+                vel_noise = torch.randn(n_relocate, 3, device='cuda') * 0.05
+                self.model._motion.data[donor_indices] = (
+                    self.model._motion.data[receptor_indices] + vel_noise
+                )
+            if 'gate' in self.model._gaussian_params:
+                self.model._gate.data[donor_indices] = self.model._gate.data[receptor_indices]
+
+        # Reset optimizer momentum for relocated points
         self.optimizer.reset_optimizer_state(final_mask)
-        
-        # print(f"[Relocation] Relocated {n_receptors} gaussians at iter {iteration}")
 
     def _log_metrics(self, iteration: int, metrics: Dict[str, float]):
         super()._log_metrics(iteration, metrics)

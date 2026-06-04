@@ -71,7 +71,11 @@ class ModelConfig:
     time_dim: int = 0  # Time dimension
     motion_dim: int = 0  # Motion dimension
     normalized_t: bool = False # Use normalized time (0-1) or seconds
-    
+
+    # FreeTimeGS++ Gated Marginalization
+    gated_marginalization: bool = False  # learnable gate blends persistent/transient opacity
+    gate_sharpness: float = 20.0         # γ: steepness of gate sigmoid (paper uses 20)
+
     def __post_init__(self):
         assert self.mode in ["static", "freetime"], \
             f"Mode must be 'static' or 'freetime', got '{self.mode}'"
@@ -107,6 +111,7 @@ class OptimConfig:
     t_lr: float = 0.0001
     t_scale_lr: float = 0.005
     velocity_lr: float = 0.00016
+    gate_lr: float = 0.0001  # FreeTimeGS++ gate parameter LR
     
     # Exposure Compensation Learning Rates
     exposure_lr_init: float = 0.01
@@ -272,6 +277,14 @@ class TrainerConfig:
     dynamic_duration_dynamic: float = 0.1
     dynamic_mask_threshold: float = 0.5
     dynamic_weight_cache_update_interval: int = 10000
+
+    # FreeTimeGS++ Gated Marginalization loss weight
+    lambda_gate: float = 0.001  # penalizes intermediate gate values (pushes toward 0 or 1)
+
+    # FreeTimeGS++ Affine Color Correction (per-camera scale+bias, reduces run-to-run variance)
+    color_correction_enabled: bool = False
+    cc_lr: float = 0.001
+    lambda_cc: float = 0.001  # regularization: penalize scale≠1 and bias≠0
 
     # Phase-based decoupled training (FreeTimeGS)
     # Phase 1 (0 ~ joint_end):          joint training, both static/dynamic updated freely
