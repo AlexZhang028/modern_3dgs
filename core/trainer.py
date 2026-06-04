@@ -191,6 +191,33 @@ class Trainer:
         else:
             raise ValueError(f"Unknown training mode: {self.mode}")
     
+    # ---- Classification helpers (gate-first, t_scale fallback) ----
+
+    def _get_static_mask(self) -> torch.Tensor:
+        """Boolean mask [N]: True = static/persistent, False = dynamic/transient.
+        Uses gate parameter when gated_marginalization is active; falls back to
+        t_scale threshold so all classification is consistent across the codebase.
+        """
+        if 'gate' in self.model._gaussian_params:
+            return self.model.get_gate.squeeze() > 0.5
+        dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
+        return self.model.get_t_scale.squeeze() > dur_thresh
+
+    def _get_dynamic_score(self) -> torch.Tensor:
+        """Per-Gaussian dynamism score [N,1] in [0,1]: 0=static, 1=dynamic.
+        Used to render 2D dynamic weight maps for loss weighting and visualisation.
+        Uses gate when available; falls back to t_scale-based formula.
+        """
+        if 'gate' in self.model._gaussian_params:
+            return (1.0 - self.model.get_gate).detach()  # [N,1]
+        duration    = self.model.get_t_scale.detach()    # [N,1]
+        static_dur  = getattr(self.config, 'dynamic_duration_static',  0.5)
+        dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
+        denom = max(static_dur - dynamic_dur, 1e-6)
+        return torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+
+    # ----------------------------------------------------------------
+
     def train(self):
         """Main training loop."""
         print("\n" + "=" * 60)
@@ -383,14 +410,8 @@ class Trainer:
             cache_hit = 0.0
             if need_update:
                 with torch.no_grad():
-                    duration = self.model.get_t_scale.detach()
-                    static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
-                    dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
-                    denom = max(static_dur - dynamic_dur, 1e-6)
-
-                    # 0.0 for static points, 1.0 for highly dynamic points
-                    dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
-                    override_colors = dynamic_score.repeat(1, 3)
+                    dynamic_score   = self._get_dynamic_score()   # [N,1], 0=static 1=dynamic
+                    override_colors = dynamic_score.repeat(1, 3)  # [N,3]
 
                 with torch.no_grad():
                     weight_render_out = self.renderer(
@@ -533,9 +554,7 @@ class Trainer:
             dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
             if iteration > joint_end:
                 with torch.no_grad():
-                    dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
-                    duration   = self.model.get_t_scale.squeeze()  # [N], already exp-activated
-                    is_static  = duration > dur_thresh
+                    is_static  = self._get_static_mask()  # gate>0.5 or t_scale>thresh
                     is_dynamic = ~is_static
 
                     freeze_mask = is_static if iteration <= dynamic_end else is_dynamic
@@ -660,10 +679,8 @@ class Trainer:
                     joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
                     dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
                     if iteration > joint_end:
-                        dur_thresh   = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
-                        duration     = self.model.get_t_scale.squeeze()
-                        freeze_mask  = (duration > dur_thresh) if iteration <= dynamic_end \
-                                       else (duration <= dur_thresh)
+                        _is_static  = self._get_static_mask()
+                        freeze_mask = _is_static if iteration <= dynamic_end else ~_is_static
                         self.densifier.xyz_gradient_accum[freeze_mask] = 0.0
                         self.densifier.denom[freeze_mask] = 0.0
 
@@ -840,8 +857,7 @@ class Trainer:
             above_prune_safe = (current_opacity > 0.015)
             
             if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                duration = self.model.get_t_scale
-                is_static_mask = (duration > 0.5)
+                is_static_mask = self._get_static_mask().unsqueeze(-1)
                 target_mask = is_static_mask & is_semi_transparent & above_prune_safe
             else:
                 target_mask = is_semi_transparent & above_prune_safe
@@ -934,10 +950,8 @@ class Trainer:
             if getattr(self.config, 'decouple_training_enabled', False) \
                     and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
                 with torch.no_grad():
-                    dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
-                    duration   = self.model.get_t_scale.squeeze()
-                    n_static   = int((duration > dur_thresh).sum().item())
-                    n_dynamic  = self.model.num_points - n_static
+                    n_static  = int(self._get_static_mask().sum().item())
+                    n_dynamic = self.model.num_points - n_static
                 self.writer.add_scalar('Decouple/n_static',  n_static,  iteration)
                 self.writer.add_scalar('Decouple/n_dynamic', n_dynamic, iteration)
                 joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
@@ -1029,12 +1043,7 @@ class Trainer:
 
                 if use_masked_psnr:
                     with torch.no_grad():
-                        duration = self.model.get_t_scale.detach()
-                        static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
-                        dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
-                        denom = max(static_dur - dynamic_dur, 1e-6)
-
-                        dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+                        dynamic_score   = self._get_dynamic_score()
                         override_colors = dynamic_score.repeat(1, 3)
 
                         weight_render_out = self._render_for_eval(
@@ -1076,13 +1085,7 @@ class Trainer:
                     # Dynamic weight heatmap (if enabled)
                     if getattr(self.config, 'dynamic_weighting_enabled', False) and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
                         with torch.no_grad():
-                            duration = self.model.get_t_scale.detach()
-                            static_dur = getattr(self.config, 'dynamic_duration_static', 0.5)
-                            dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
-                            denom = max(static_dur - dynamic_dur, 1e-6)
-
-                            # 0.0 static, 1.0 dynamic
-                            dynamic_score = torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+                            dynamic_score   = self._get_dynamic_score()
                             override_colors = dynamic_score.repeat(1, 3)
 
                             weight_render_out = self._render_for_eval(
