@@ -16,9 +16,11 @@ from torch.utils.data import DataLoader
 
 from config.config import TrainerConfig, DataConfig
 from utils.image_utils import psnr
-import utils.general_utils as utils
 from core.loss import l1_loss, ssim, fast_ssim, GaussianLoss
-from core.densify import GaussianDensifier, DensificationConfig
+from core.densify import (
+    GaussianDensifier, DensificationConfig,
+    DensificationScheduler, FreeTimeDensificationScheduler,
+)
 from data.samplers import DataSampler, StaticSampler, TemporalSampler
 from utils.general_utils import inverse_sigmoid
 
@@ -83,18 +85,6 @@ class Trainer:
         if self.lpips_enabled:
             self.loss_fn = self.loss_fn.cuda()
         
-        # Create Densifier
-        densify_config = DensificationConfig(
-            densify_grad_threshold=config.densify_grad_threshold,
-            densify_from_iter=config.densify_from_iter,
-            densify_until_iter=config.densify_until_iter,
-            densify_interval=config.densify_interval,
-            prune_opacity_threshold=config.prune_opacity_threshold,
-            prune_size_threshold=config.prune_size_threshold,
-        )
-        # Fix: Pass the GaussianOptimizer wrapper, not the raw Adam optimizer
-        # This allows Densifier to use wrapper methods like cat_tensors_to_optimizer
-        self.densifier = GaussianDensifier(densify_config, model, optimizer)
         
         # Create Output Directories
         self.output_dir = Path(config.output_dir)
@@ -119,19 +109,10 @@ class Trainer:
         self.current_iteration = 0
         self.current_sh_degree = 0
 
-        # Depth Loss Scheduler (for whiteroom/monocular depth datasets)
         from utils.general_utils import get_expon_lr_func
         self.depth_l1_weight = get_expon_lr_func(
-            config.depth_l1_weight_init, 
-            config.depth_l1_weight_final, 
-            max_steps=config.iterations
-        )
-        
-        # Depth Loss Scheduler (for whiteroom/monocular depth datasets)
-        from utils.general_utils import get_expon_lr_func
-        self.depth_l1_weight = get_expon_lr_func(
-            config.depth_l1_weight_init, 
-            config.depth_l1_weight_final, 
+            config.depth_l1_weight_init,
+            config.depth_l1_weight_final,
             max_steps=config.iterations
         )
 
@@ -143,6 +124,7 @@ class Trainer:
         
         # Compute Scene Extent (Once)
         self.scene_extent = self._compute_scene_extent()
+        self.densifier = self._create_densifier()
 
         # Select fixed views for testing
         self.train_view_indices = self._select_fixed_views(len(dataset))
@@ -181,6 +163,59 @@ class Trainer:
         else:
             return torch.linspace(0, num_total_views - 1, num_views).round().long().tolist()
     
+    def _create_densifier(self) -> DensificationScheduler:
+        """Factory: build the densification scheduler for this trainer.
+        Subclasses override to return a FreeTimeDensificationScheduler.
+        """
+        densify_config = DensificationConfig(
+            densify_grad_threshold=self.config.densify_grad_threshold,
+            densify_from_iter=self.config.densify_from_iter,
+            densify_until_iter=self.config.densify_until_iter,
+            densify_interval=self.config.densify_interval,
+            prune_opacity_threshold=self.config.prune_opacity_threshold,
+            prune_size_threshold=self.config.prune_size_threshold,
+        )
+        raw_densifier = GaussianDensifier(densify_config, self.model, self.optimizer)
+        return DensificationScheduler(
+            densifier      = raw_densifier,
+            model          = self.model,
+            optimizer      = self.optimizer,
+            config         = self.config,
+            scene_extent   = self.scene_extent,
+            static_mask_fn = self._get_static_mask,
+        )
+
+    def _apply_gradient_routing(self, iteration: int) -> None:
+        """Phase-based gradient zeroing (Phase 2 / 3 of decoupled training).
+        Operates directly on grad tensors after backward(), so it stays in Trainer.
+        """
+        if not getattr(self.config, 'decouple_training_enabled', False):
+            return
+        if not (hasattr(self.model, '_t_scale') and self.model._t_scale is not None):
+            return
+
+        joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+        dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+        if iteration <= joint_end:
+            return
+
+        with torch.no_grad():
+            is_static   = self._get_static_mask()
+            freeze_mask = is_static if iteration <= dynamic_end else ~is_static
+            if not freeze_mask.any():
+                return
+
+            for key in ['xyz', 'features_dc', 'features_rest', 'opacity', 'scaling', 'rotation']:
+                p = self.model._gaussian_params.get(key)
+                if p is not None and p.grad is not None:
+                    p.grad[freeze_mask] = 0.0
+
+            if iteration > dynamic_end:
+                for key in ['t', 't_scale', 'motion']:
+                    p = self.model._gaussian_params.get(key)
+                    if p is not None and p.grad is not None:
+                        p.grad[freeze_mask] = 0.0
+
     def _create_sampler(self) -> DataSampler:
         """Create data sampler."""
         num_workers = self.data_config.num_workers if self.data_config else 0
@@ -301,7 +336,7 @@ class Trainer:
             'depth_reg_ms': 0.0,
             'backward_ms': 0.0,
             'stats_update_ms': 0.0,
-            'post_backward_ms': 0.0,
+            'relocate_ms': 0.0,
             'densify_prune_ms': 0.0,
             'opacity_reset_ms': 0.0,
             'adaptive_control_ms': 0.0,
@@ -545,207 +580,16 @@ class Trainer:
         # total backward time (preserves existing metric)
         timing['backward_ms'] = (t_sync_after - t_bw_total_start) * 1000.0
 
-        # 7.5. Phase-based gradient routing (FreeTimeGS decoupled training)
-        # Phase 2 (joint_end ~ dynamic_end): zero static Gaussian grads -> only dynamic updates
-        # Phase 3 (dynamic_end ~ end):       zero dynamic Gaussian grads -> only static updates
-        if getattr(self.config, 'decouple_training_enabled', False) \
-                and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-            joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
-            dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-            if iteration > joint_end:
-                with torch.no_grad():
-                    is_static  = self._get_static_mask()  # gate>0.5 or t_scale>thresh
-                    is_dynamic = ~is_static
-
-                    freeze_mask = is_static if iteration <= dynamic_end else is_dynamic
-
-                    if freeze_mask.any():
-                        # Zero spatial/color/geometry gradients for frozen group
-                        for key in ['xyz', 'features_dc', 'features_rest',
-                                    'opacity', 'scaling', 'rotation']:
-                            p = self.model._gaussian_params.get(key)
-                            if p is not None and p.grad is not None:
-                                p.grad[freeze_mask] = 0.0
-
-                        # Phase 3 (static focus): also freeze temporal params of dynamic Gaussians
-                        # to protect the 4D structure established during Phase 2
-                        if iteration > dynamic_end:
-                            for key in ['t', 't_scale', 'motion']:
-                                p = self.model._gaussian_params.get(key)
-                                if p is not None and p.grad is not None:
-                                    p.grad[freeze_mask] = 0.0
+        # 7.5. Phase-based gradient routing (must stay in trainer: directly touches grad tensors)
+        self._apply_gradient_routing(iteration)
 
         # 8. Adaptive Control (Densification, Pruning, Relocation)
         with torch.no_grad():
             t_block = time.perf_counter()
-            if iteration < self.config.densify_until_iter:
-                # Accumulate stats
-                # Handle FreeTimeGS Culled rendering:
-                # If renderer returns 'culled_mask', we need to map results back to full indices
-                # or tell densifier that we only have partial update.
-                # However, Densifier logic assumes it tracks stats for ALL gaussians globally.
-                # Standard 3DGS doesn't cull gaussians from the Model list during render, it just culls them from rasterizer.
-                # But FreeTimeGS `render_temporal` actively slices the tensors if `enable_culling=True`.
-                # This breaks the 1:1 mapping needed for update_stats.
-                
-                # Check if we have culled mask
-                t_stats = time.perf_counter()
-                if 'culled_mask' in rendered and rendered['culled_mask'] is not None:
-                     culled_mask = rendered['culled_mask']
-                     
-                     # Map partial filters to full size
-                     # rendered indices are relative to the SUBSET of selected gaussians
-                     # We need to construct full-size filter/radii updates.
-                     
-                     # Only update stats for the visible ones in the culled set
-                     vis_filter_subset = rendered['visibility_filter'] # [M]
-                     viewspace_subset = rendered['viewspace_points'] # [M, 3]
-                     radii_subset = rendered['radii'] # [M]
-                     
-                     # Construct global update masks
-                     # We need to update self.densifier.xyz_gradient_accum[culled_mask][vis_filter_subset]
-                     # BUT densifier.update_stats takes simple flat arguments and assumes full alignment.
-                     
-                     # We need to call a specialized update or manually handle it.
-                     # Let's call a modified method if available, or manually inject.
-                     # Actually, the densifier class needs robustness.
-                     
-                     # Simpler approach: Map `visibility_filter` to global indices
-                     global_vis_filter = torch.zeros(self.model.num_points, dtype=torch.bool, device="cuda")
-                     
-                     # The indices within `culled_mask` that are visible
-                     # culled_mask is boolean [N]. indices = which are true.
-                     active_indices = torch.nonzero(culled_mask).view(-1) # [M]
-                     
-                     # Visible ones within the active set
-                     visible_active_indices = active_indices[vis_filter_subset]
-                     
-                     global_vis_filter[visible_active_indices] = True
-                     
-                     # For viewspace points and radii, update_stats normally expects full-size tensors?
-                     # No, update_stats(viewspace, filter, radii)
-                     # self.xyz_gradient_accum[update_filter] += grad_norm[update_filter]
-                     # Here update_filter acts as the indexer.
-                     
-                     # HOWEVER, viewspace_point_tensor must have gradients.
-                     # In culled mode, only viewspace_subset has gradients.
-                     # If we pass a sparse viewspace tensor, it won't work.
-                     
-                     # Solution: Pass the SUBSET to a specific method in Densifier, 
-                     # OR map everything to global.
-                     # Since gradients are on viewspace_subset, we must use viewspace_subset.
-                     
-                     # We will use a custom call to `densifier.add_densification_stats` with indices.
-                     
-                     # 1. Update Gradient Stats
-                     # Extract gradients from subset
-                     if viewspace_subset.grad is not None:
-                         grad_norm_subset = torch.norm(viewspace_subset.grad[:, :2], dim=-1, keepdim=True) # [M, 1]
-                         
-                         # Apply visibility on subset
-                         visible_grad_norm = grad_norm_subset[vis_filter_subset]
-                         
-                         # Accumulate to global
-                         self.densifier.xyz_gradient_accum[visible_active_indices] += visible_grad_norm
-                         self.densifier.denom[visible_active_indices] += 1.0
-
-                         del visible_grad_norm
-                     
-                     radii_visible = radii_subset[vis_filter_subset]
-                     
-                     self.densifier.max_radii2D[visible_active_indices] = torch.max(
-                         self.densifier.max_radii2D[visible_active_indices],
-                         radii_visible
-                     )
-
-                     # Explicitly delete intermediate indexing tensors to prevent accumulation
-                     del visible_active_indices
-                     del active_indices
-                     del culled_mask
-                     
-                else:
-                    # Standard execution
-                    self.densifier.update_stats(
-                        viewspace_point_tensor=rendered['viewspace_points'],
-                        visibility_filter=rendered['visibility_filter'],
-                        radii=rendered['radii']
-                    )
-                timing['stats_update_ms'] = (time.perf_counter() - t_stats) * 1000.0
-
-                # Phase-based densification masking: prevent frozen Gaussians from accumulating
-                # densification stats, so they won't be cloned/split during the wrong phase
-                if getattr(self.config, 'decouple_training_enabled', False) \
-                        and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                    joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
-                    dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-                    if iteration > joint_end:
-                        _is_static  = self._get_static_mask()
-                        freeze_mask = _is_static if iteration <= dynamic_end else ~_is_static
-                        self.densifier.xyz_gradient_accum[freeze_mask] = 0.0
-                        self.densifier.denom[freeze_mask] = 0.0
-
-                # Relocation Hook
-                t_post = time.perf_counter()
-                self._post_backward_hook(iteration, rendered, target, camera, timestamp)
-                timing['post_backward_ms'] = (time.perf_counter() - t_post) * 1000.0
-
-                # --- Strategy 3: Annealing Threshold ---
-                opacity_reset_until = getattr(self.config, 'opacity_reset_until_iter', 15000)
-                densify_until = self.config.densify_until_iter
-                base_grad = self.config.densify_grad_threshold
-                final_grad = getattr(self.config, 'densify_grad_threshold_final', 0.0003)
-                
-                current_grad_threshold = base_grad
-                if iteration > opacity_reset_until and densify_until > opacity_reset_until:
-                    progress = min((iteration - opacity_reset_until) / float(densify_until - opacity_reset_until), 1.0)
-                    current_grad_threshold = base_grad + progress * (final_grad - base_grad)
-
-                # --- Strategy 2: Staggered Execution ---
-                just_decayed = (iteration % getattr(self.config, 'opacity_reset_interval', 3000) == 0)
-
-                # Standard Densify and Prune
-                if iteration > getattr(self.config, 'densify_from_iter', 500) and iteration <= self.config.densify_until_iter and iteration % getattr(self.config, 'densify_interval', 100) == 0:
-                    size_threshold = 20 if iteration > getattr(self.config, 'opacity_reset_interval', 3000) else None
-
-                    # Fix: Densify and prune BEFORE opacity decay/reset in this trigger iteration.
-                    # Without this, we skip the densification completely at trigger steps (like 3000, 6000),
-                    # and immediately clear stats below, which permanently deletes 100 steps of gradient accumulation
-                    # exactly when it is most mature.
-
-                    # Phase 2 dynamic densification boost:
-                    # In Phase 2 static Gaussian stats are zeroed, so lowering the threshold only
-                    # affects dynamic Gaussians — no risk of inflating static regions.
-                    effective_grad_threshold = current_grad_threshold
-                    effective_n_split = None  # None -> densifier uses its config default
-                    if getattr(self.config, 'decouple_training_enabled', False):
-                        _joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
-                        _dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-                        if _joint_end < iteration <= _dynamic_end:
-                            densify_mult = getattr(self.config, 'decouple_dynamic_densify_mult', 0.5)
-                            effective_grad_threshold = current_grad_threshold * densify_mult
-                            effective_n_split = getattr(self.config, 'decouple_dynamic_n_split', 3)
-
-                    t_densify = time.perf_counter()
-                    self.densifier.densify_and_prune(
-                        iteration=iteration,
-                        max_grad=effective_grad_threshold,
-                        min_opacity=getattr(self.config, 'prune_opacity_threshold', 0.005),
-                        extent=self.scene_extent,
-                        max_screen_size=size_threshold,
-                        n_split_override=effective_n_split,
-                    )
-                    timing['densify_prune_ms'] = (time.perf_counter() - t_densify) * 1000.0
-                
-                # Opacity Reset
-                if iteration <= self.config.densify_until_iter:
-                    if just_decayed or \
-                       (self.config.white_background and iteration == self.config.densify_from_iter):
-                        t_reset = time.perf_counter()
-                        self._reset_opacity(iteration)
-                        # Fix: Reset densification stats immediately after opacity reset 
-                        # to ensure the next 100 steps track fresh post-reset gradients correctly.
-                        self.densifier.reset_stats()
-                        timing['opacity_reset_ms'] = (time.perf_counter() - t_reset) * 1000.0
+            t_stats = time.perf_counter()
+            self.densifier.record_stats(rendered, iteration)
+            timing['stats_update_ms'] = (time.perf_counter() - t_stats) * 1000.0
+            timing.update(self.densifier.step(iteration))
             timing['adaptive_control_ms'] = (time.perf_counter() - t_block) * 1000.0
         
         # Periodic garbage collection for VRAM fragmentation 
@@ -796,10 +640,6 @@ class Trainer:
         """Hook for additional loss computation."""
         return loss
 
-    def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
-        """Hook for post-backward operations (e.g. relocation)."""
-        pass
-
     def _update_sh_degree(self, iteration: int):
         """Progressive SH degree activation."""
         max_sh_degree = self.model.max_sh_degree
@@ -833,46 +673,6 @@ class Trainer:
 
         return 20.0 * torch.log10(torch.tensor(1.0, device=prediction.device) / torch.sqrt(mse)).item()
 
-
-    
-    def _reset_opacity(self, iteration: int = 0):
-        """
-        Modified Opacity Reset:
-        - Hard reset (0.01) in the early stage.
-        - Target soft decay (x0.95) in the late stage to clean up floaters.
-        """
-        current_opacity = self.model.get_opacity
-        
-        if iteration <= getattr(self.config, 'opacity_reset_until_iter', 15000):
-            target_opacity = torch.min(current_opacity, torch.ones_like(current_opacity) * 0.05)
-            opacities_new = utils.inverse_sigmoid(target_opacity)
-            
-            # For hard reset, we must throw away the entire tensor state and reset Adam momentum
-            optimizable_tensors = self.optimizer.replace_tensor_to_optimizer(opacities_new, "opacity")
-            self.model._opacity = optimizable_tensors["opacity"]
-        else:
-            is_semi_transparent = (current_opacity < 0.5)
-            
-            # Lower bound protection to stop mass pruning of border-line fogs
-            above_prune_safe = (current_opacity > 0.015)
-            
-            if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                is_static_mask = self._get_static_mask().unsqueeze(-1)
-                target_mask = is_static_mask & is_semi_transparent & above_prune_safe
-            else:
-                target_mask = is_semi_transparent & above_prune_safe
-                
-            decay_mask = target_mask.squeeze(-1)
-            if decay_mask.any():
-                # For soft decay, perform strictly in-place modification.
-                # If we use replace_tensor_to_optimizer, Adam's exp_avg_sq is wiped to 0.
-                # This causes the effective learning rate to shoot back up to lr=0.025,
-                # propelling borderline points directly below 0.005 and triggering mass pruning.
-                with torch.no_grad():
-                    decayed_opacity = current_opacity[decay_mask] * 0.95
-                    self.model._opacity.data[decay_mask] = utils.inverse_sigmoid(decayed_opacity)
-        
-        # print(f"Opacity Reset Done.")
 
     
     def _compute_scene_extent(self) -> float:
@@ -925,7 +725,7 @@ class Trainer:
                 'backward_compute_ms',
                 'backward_sync_after_ms',
                 'stats_update_ms',
-                'post_backward_ms',
+                'relocate_ms',
                 'densify_prune_ms',
                 'opacity_reset_ms',
                 'adaptive_control_ms',
@@ -1347,100 +1147,24 @@ class FreeTimeTrainer(Trainer):
             
         return loss
 
-    def _post_backward_hook(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
-        # Periodic Relocation
-        if iteration > self.config.densify_from_iter and iteration <= getattr(self.config, 'densify_until_iter', 15000) and \
-           iteration % self.config.relocation_interval == 0:
-            self._relocate_gaussians(iteration, rendered, target, camera, timestamp)
-
-    def _relocate_gaussians(self, iteration: int, rendered: Dict, target: torch.Tensor, camera: Any, timestamp: float = 0.0):
-        """
-        MCMC-style Relocation (FreeTimeGS++, Secret 4).
-        Donors inherit ALL parameters from their receptor (including appearance, temporal
-        params, and gate), with opacity and scale normalized by the number of clones sharing
-        that receptor to prevent opacity accumulation artifacts.
-        """
-        import math
-
-        # 1. Donors: low-opacity Gaussians to recycle
-        opac = self.model.get_opacity.squeeze()
-        prune_mask = (opac < 0.01) & (opac >= 0.005)
-        num_prune = prune_mask.sum().item()
-        if num_prune == 0:
-            return
-
-        if self.densifier.denom.sum() == 0:
-            return
-
-        # 2. Score receptors: s = 0.5 * normalised_grad + 0.5 * opacity
-        grads = self.densifier.xyz_gradient_accum / torch.clamp(self.densifier.denom, min=1e-6)
-        grads[grads.isnan()] = 0.0
-        grad_norm = torch.norm(grads, dim=-1)
-        g_max = grad_norm.max()
-        if g_max > 0:
-            grad_norm = grad_norm / g_max
-        score = 0.5 * grad_norm + 0.5 * opac
-        score[prune_mask] = -1.0
-
-        n_relocate = min(num_prune, (~prune_mask).sum().item())
-        if n_relocate == 0:
-            return
-
-        _, receptor_indices = torch.topk(score, n_relocate)  # [n_relocate]
-
-        donor_all = torch.nonzero(prune_mask).squeeze()
-        if donor_all.ndim == 0 and num_prune > 0:
-            donor_all = donor_all.unsqueeze(0)
-        donor_indices = donor_all[:n_relocate]  # [n_relocate]
-
-        final_mask = torch.zeros_like(prune_mask)
-        final_mask[donor_indices] = True
-
-        # 3. MCMC normalization: count donors per receptor for opacity/scale adjustment
-        # Total primitives at each receptor location after relocation = receptor + n_donors
-        # Each donor gets opacity/scale reduced by log(n_total) so total rendering
-        # contribution stays balanced (prevents haze-like artifact accumulation).
-        counts = torch.zeros(self.model.num_points, device='cuda', dtype=torch.float32)
-        counts.scatter_add_(0, receptor_indices, torch.ones(n_relocate, device='cuda'))
-        log_n_total = torch.log((counts[receptor_indices] + 1.0).clamp(min=1.0))  # [n_relocate]
-
-        with torch.no_grad():
-            # Position: inherit receptor xyz + small spatial perturbation
-            xyz_noise = (torch.rand(n_relocate, 3, device='cuda') - 0.5) * 0.01
-            self.model._xyz.data[donor_indices] = (
-                self.model._xyz.data[receptor_indices] + xyz_noise
-            )
-
-            # Appearance: full inheritance (prevents dead Gaussian's stale color bleeding)
-            self.model._features_dc.data[donor_indices]   = self.model._features_dc.data[receptor_indices]
-            self.model._features_rest.data[donor_indices] = self.model._features_rest.data[receptor_indices]
-            self.model._rotation.data[donor_indices]      = self.model._rotation.data[receptor_indices]
-
-            # MCMC scale: log_scale -= log(n_total)/3  (preserves total volume)
-            self.model._scaling.data[donor_indices] = (
-                self.model._scaling.data[receptor_indices] - (log_n_total / 3.0).unsqueeze(-1)
-            )
-
-            # MCMC opacity: logit_opacity -= log(n_total)  (preserves total rendered opacity)
-            self.model._opacity.data[donor_indices] = (
-                self.model._opacity.data[receptor_indices] - log_n_total.unsqueeze(-1)
-            )
-
-            # Temporal params: full inheritance (preserves learned time-space structure)
-            if hasattr(self.model, '_t') and self.model._t is not None:
-                self.model._t.data[donor_indices] = self.model._t.data[receptor_indices]
-            if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                self.model._t_scale.data[donor_indices] = self.model._t_scale.data[receptor_indices]
-            if hasattr(self.model, '_motion') and self.model._motion is not None:
-                vel_noise = torch.randn(n_relocate, 3, device='cuda') * 0.05
-                self.model._motion.data[donor_indices] = (
-                    self.model._motion.data[receptor_indices] + vel_noise
-                )
-            if 'gate' in self.model._gaussian_params:
-                self.model._gate.data[donor_indices] = self.model._gate.data[receptor_indices]
-
-        # Reset optimizer momentum for relocated points
-        self.optimizer.reset_optimizer_state(final_mask)
+    def _create_densifier(self) -> FreeTimeDensificationScheduler:
+        densify_config = DensificationConfig(
+            densify_grad_threshold=self.config.densify_grad_threshold,
+            densify_from_iter=self.config.densify_from_iter,
+            densify_until_iter=self.config.densify_until_iter,
+            densify_interval=self.config.densify_interval,
+            prune_opacity_threshold=self.config.prune_opacity_threshold,
+            prune_size_threshold=self.config.prune_size_threshold,
+        )
+        raw_densifier = GaussianDensifier(densify_config, self.model, self.optimizer)
+        return FreeTimeDensificationScheduler(
+            densifier      = raw_densifier,
+            model          = self.model,
+            optimizer      = self.optimizer,
+            config         = self.config,
+            scene_extent   = self.scene_extent,
+            static_mask_fn = self._get_static_mask,
+        )
 
     def _log_metrics(self, iteration: int, metrics: Dict[str, float]):
         super()._log_metrics(iteration, metrics)
