@@ -675,59 +675,6 @@ class FreeTimeGaussianModel(GaussianModel):
             'mask': mask
         }
 
-    def relocate(self, mask: torch.Tensor, new_xyz: torch.Tensor, timestamp: float, new_motion: Optional[torch.Tensor] = None):
-        """
-        Relocate masked gaussians to new positions and reset their temporal attributes.
-        Used for periodic relocation in FreeTimeGS.
-        
-        Args:
-           mask: Boolean mask of gaussians to relocate [N]
-           new_xyz: New 3D positions for these gaussians [M, 3] where M = mask.sum()
-           timestamp: Current time to set as new mu_t
-           new_motion: New velocity for these gaussians [M, 3]. If None, resets to 0.
-        """
-        if mask.sum() == 0:
-            return
-
-        # 1. Reset Position (XYZ) to new locations
-        # Note: Optimizer update is handled by replace_tensor_to_optimizer in densifier usually, 
-        # but here we might just modify the tensor data if the optimizer link is preserved,
-        # OR we rely on the densifier to handle the parameter replacement.
-        # However, standard densification acts on *shapes*. Relocation modifies existing values.
-        # If we just change .data, Adam states (momentum) are stale. 
-        # Ideally we should zero out their momentum.
-        
-        # For simplicity and speed in this specific implementation:
-        # We assume this is called *during* densification logic where we might handle optimization updates.
-        # But if called standalone, we must be careful.
-        # The prompt implies a method on the model.
-        
-        # Update XYZ
-        optimizable_tensors = {}
-        
-        # Direct data modification (simplest, though momentum might push it away initially)
-        self._xyz[mask] = new_xyz.to(self.device)
-        
-        # 2. Reset Time (mu_t) -> Current Time
-        self._t[mask] = timestamp
-        
-        # 3. Reset Motion -> Inherited velocity or 0
-        if new_motion is not None:
-             self._motion[mask] = new_motion.to(self.device)
-        else:
-             self._motion[mask] = 0.0
-
-        
-        # 4. Reset Opacity -> slightly increased to survive execution
-        # inverse_sigmoid(0.5) is 0.0. inverse_sigmoid(0.1) is -2.19
-        new_opacity = inverse_sigmoid(0.1 * torch.ones(mask.sum(), 1, device=self.device))
-        self._opacity[mask] = new_opacity
-        
-        # 5. Reset Duration -> random small duration, rand*2 -> [0,2]. -3 -> [-3, -1]. Correct.
-        n_relocated = mask.sum()
-        random_tscales = (torch.rand(n_relocated, 1, device="cuda") * 2.0) - 3.0 
-        self._t_scale[mask] = random_tscales
-
 
 def detect_mode_from_ply(ply_path: str) -> str:
     """

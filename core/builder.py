@@ -89,16 +89,8 @@ def setup_model(
     """Setup model with initialization strategy (PointCloud / Random)."""
     print(f"\nInitializing Model (Mode: {model_config.mode})")
     
-    gaussian_config = ModelConfig(
-        mode=model_config.mode,
-        sh_degree=model_config.sh_degree,
-        time_dim=model_config.time_dim if model_config.mode == "freetime" else 0,
-        motion_dim=model_config.motion_dim if model_config.mode == "freetime" else 0,
-        normalized_t=model_config.normalized_t,
-    )
-    
     # Create model
-    model = create_model_from_config(gaussian_config)
+    model = create_model_from_config(model_config)
     
     # Sync Normalized T Check
     if model_config.normalized_t != data_config.normalized_t:
@@ -236,18 +228,7 @@ def setup_optimizer(model: GaussianModel, optim_config: OptimConfig) -> Gaussian
     """Setup optimizer."""
     print("\nConfiguring Optimizer")
     
-    optimizer_config = OptimConfig(
-        position_lr_init=optim_config.position_lr_init,
-        position_lr_final=optim_config.position_lr_final,
-        position_lr_delay_mult=optim_config.position_lr_delay_mult,
-        position_lr_max_steps=optim_config.position_lr_max_steps,
-        feature_lr=optim_config.feature_lr,
-        opacity_lr=optim_config.opacity_lr,
-        scaling_lr=optim_config.scaling_lr,
-        rotation_lr=optim_config.rotation_lr,
-    )
-    
-    optimizer = GaussianOptimizer(model, optimizer_config)
+    optimizer = GaussianOptimizer(model, optim_config)
     
     print("   Optimizer: Adam")
     return optimizer
