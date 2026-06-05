@@ -585,7 +585,7 @@ class StaticGaussianDataset(GaussianDataset):
                 width=width,
                 height=height,
             )
-            
+
             camera._image_path = image_path
             camera._depth_path = depth_path
             camera._depth_params = None
@@ -777,7 +777,7 @@ class SelfCapVideoDataset(GaussianDataset):
                     width=final_width,
                     height=final_height,
                     timestamp=selected_timestamp,
-                    timestamp_seconds=time_sec
+                    timestamp_seconds=time_sec,
                 )
                 
                 # Store video info

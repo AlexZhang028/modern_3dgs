@@ -35,7 +35,7 @@ class DataConfig:
     eval: bool = False  # Evaluation mode
     train_test_exp: bool = False  # Use train/test exposure compensation
     cache_images: bool = True  # Cache images to memory/VRAM
-    num_workers: int = 4  # DataLoader workers
+    num_workers: int = 0  # DataLoader workers (0 = main-thread sampling, fastest for pre-cached data)
     pin_memory: bool = True  # Use pin_memory
     lazy_loading: bool = False  # Lazy loading (False = preload all images)
     normalized_t: bool = False # Use normalized time (0-1) or seconds for dataset loading
@@ -271,6 +271,9 @@ class TrainerConfig:
     dynamic_duration_static: float = 0.5
     dynamic_duration_dynamic: float = 0.1
     dynamic_mask_threshold: float = 0.5
+
+    # Power Monitoring
+    power_monitoring: bool = False
 
 # ============================================================================
 # Full Training Configuration

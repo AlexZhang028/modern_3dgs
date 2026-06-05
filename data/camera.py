@@ -90,23 +90,23 @@ class Camera:
     projection_matrix: Optional[torch.Tensor] = None
     full_proj_transform: Optional[torch.Tensor] = None
     camera_center: Optional[torch.Tensor] = None
-    
+
     # Others
     znear: float = 0.01
     zfar: float = 100.0
     colmap_id: int = -1
-    
+
     def __post_init__(self):
         """Compute FOV and transforms after initialization."""
         if self.trans is None:
             self.trans = np.array([0.0, 0.0, 0.0])
-        
+
         # Auto-compute missing FOV
         if self.FovX is None and self.FovY is None:
             raise ValueError("Must provide at least one of FovX or FovY")
-        
+
         aspect_ratio = self.width / self.height
-        
+
         if self.FovX is None:
             # Compute FovX from FovY
             self.FovX = compute_fov_from_aspect(self.FovY, aspect_ratio, is_horizontal=False)
@@ -114,30 +114,30 @@ class Camera:
             # Compute FovY from FovX
             self.FovY = compute_fov_from_aspect(self.FovX, aspect_ratio, is_horizontal=True)
         # If both are provided, keep them as is
-        
+
         # Compute camera transforms
         self.compute_transforms()
-    
+
     def compute_transforms(self):
-        """Compute camera transformation matrices."""
+        """Compute camera transformation matrices (CPU tensors, moved to GPU lazily via .to())."""
         # World to View Transform
         w2v = getWorld2View2(self.R, self.T, self.trans, self.scale)
         self.world_view_transform = torch.tensor(w2v).transpose(0, 1)
-        
+
         # Projection Matrix
         self.projection_matrix = getProjectionMatrix(
-            znear=self.znear, 
-            zfar=self.zfar, 
-            fovX=self.FovX, 
+            znear=self.znear,
+            zfar=self.zfar,
+            fovX=self.FovX,
             fovY=self.FovY
         ).transpose(0, 1)
-        
+
         # Full Projection Transform
         self.full_proj_transform = (
             self.world_view_transform.unsqueeze(0)
             .bmm(self.projection_matrix.unsqueeze(0))
         ).squeeze(0)
-        
+
         # Camera Center (World Coordinates)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
     
@@ -162,11 +162,6 @@ class Camera:
             self.full_proj_transform = self.full_proj_transform.to(device)
         if self.camera_center is not None:
             self.camera_center = self.camera_center.to(device)
-        
-        self.world_view_transform = self.world_view_transform.to(device)
-        self.projection_matrix = self.projection_matrix.to(device)
-        self.full_proj_transform = self.full_proj_transform.to(device)
-        self.camera_center = self.camera_center.to(device)
         
         return self
     

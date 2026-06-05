@@ -119,6 +119,7 @@ class Trainer:
         self.current_iteration = 0
         self.current_sh_degree = 0
 
+
         # Depth Loss Scheduler (for whiteroom/monocular depth datasets)
         from utils.general_utils import get_expon_lr_func
         self.depth_l1_weight = get_expon_lr_func(
@@ -140,6 +141,19 @@ class Trainer:
             'loss_history': [],
             'gaussian_count': []
         }
+
+        # Energy Tracker
+        self.energy_tracker = None
+        if config.power_monitoring:
+            try:
+                from energy_tracker import EnergyTracker
+                energy_log_path = str(self.output_dir / "energy_log.csv")
+                self.energy_tracker = EnergyTracker(energy_log_path)
+                self.energy_tracker.start()
+                print(f"[EnergyTracker] 已启动，日志路径：{energy_log_path}")
+            except Exception as e:
+                print(f"[EnergyTracker] 启动失败：{e}")
+                self.energy_tracker = None
         
         # Compute Scene Extent (Once)
         self.scene_extent = self._compute_scene_extent()
@@ -182,57 +196,78 @@ class Trainer:
             print(f"   L_LPIPS: {self.config.lambda_lpips}")
         print(f"   Initial Gaussians: {self.model.num_points}")
         print("=" * 60 + "\n")
-        
+
         # Training Loop
         # ModernGS FIX: Match Original 3DGS iteration range (1 to iterations)
         # Original: range(first_iter, opt.iterations + 1) -> 1 to 30000
         progress_bar = tqdm(range(1, self.config.iterations + 1), desc="Training")
-        
-        for iteration in progress_bar:
-            self.current_iteration = iteration
-            
-            # Training Step
-            torch.cuda.synchronize()
-            iter_start = time.time()
-            metrics = self.train_step(iteration)
-            torch.cuda.synchronize()
-            iter_end = time.time()
-            metrics['iteration_time'] = (iter_end - iter_start) * 1000.0
-            
-            # Update Progress Bar
-            postfix = {
-                'loss': f"{metrics['loss']:.4f}",
-                'gaussians': self.model.num_points
-            }
-            if 'lpips' in metrics:
-                postfix['lpips'] = f"{metrics['lpips']:.4f}"
-            progress_bar.set_postfix(postfix)
-            
-            # Logging
-            if iteration % self.config.log_interval == 0:
-                self._log_metrics(iteration, metrics)
-            
-            # Testing
-            is_test_interval = (self.config.test_interval > 0) and (iteration % self.config.test_interval == 0)
-            is_test_iter = iteration in self.config.test_iterations
-            if is_test_interval or is_test_iter:
-                self._test(iteration)
-            
-            # Save Checkpoint
-            is_save_interval = (self.config.save_interval > 0) and (iteration % self.config.save_interval == 0) and (iteration > 0)
-            is_save_iter = iteration in self.config.save_iterations or iteration in self.config.checkpoint_iterations
-            if is_save_interval or is_save_iter:
-                self.save_checkpoint(iteration)
-        
-        # Save Final Model
-        print("\nTraining Complete! Saving final model...")
-        self.save_checkpoint(self.config.iterations, final=True)
+        iter_start_event = torch.cuda.Event(enable_timing=True)
+        iter_end_event   = torch.cuda.Event(enable_timing=True)
 
-        # Final Test
-        self._test(self.config.iterations)
-        
-        if self.writer:
-            self.writer.close()
+        try:
+            for iteration in progress_bar:
+                self.current_iteration = iteration
+
+                if self.energy_tracker:
+                    self.energy_tracker.mark_iter_start(iteration)
+
+                # Training Step — CUDA Event timing.
+                # iter_end_event.synchronize() blocks the CPU until the GPU reaches the
+                # end-event marker in the stream. This is required before elapsed_time():
+                # cudaEventElapsedTime does NOT synchronize internally and returns
+                # cudaErrorNotReady if the events haven't been processed yet.
+                # Using Event.synchronize() instead of torch.cuda.synchronize() is more
+                # precise: it only waits until the GPU reaches this specific marker, not
+                # until all subsequent GPU work (like the next iteration's kernels) finishes.
+                iter_start_event.record()
+                metrics = self.train_step(iteration)
+                iter_end_event.record()
+                iter_end_event.synchronize()
+                metrics['iteration_time'] = iter_start_event.elapsed_time(iter_end_event)
+
+                if self.energy_tracker:
+                    self.energy_tracker.mark_iter_end(iteration)
+                    metrics.update(self.energy_tracker.last_metrics)
+
+                # Update Progress Bar
+                postfix = {
+                    'loss': f"{metrics['loss']:.4f}",
+                    'gaussians': self.model.num_points
+                }
+                if 'lpips' in metrics:
+                    postfix['lpips'] = f"{metrics['lpips']:.4f}"
+                progress_bar.set_postfix(postfix)
+
+                # Logging
+                if iteration % self.config.log_interval == 0:
+                    self._log_metrics(iteration, metrics)
+
+                # Testing
+                is_test_interval = (self.config.test_interval > 0) and (iteration % self.config.test_interval == 0)
+                is_test_iter = iteration in self.config.test_iterations
+                if is_test_interval or is_test_iter:
+                    self._test(iteration)
+
+                # Save Checkpoint
+                is_save_interval = (self.config.save_interval > 0) and (iteration % self.config.save_interval == 0) and (iteration > 0)
+                is_save_iter = iteration in self.config.save_iterations or iteration in self.config.checkpoint_iterations
+                if is_save_interval or is_save_iter:
+                    self.save_checkpoint(iteration)
+
+            # Save Final Model
+            print("\nTraining Complete! Saving final model...")
+            self.save_checkpoint(self.config.iterations, final=True)
+
+            # Final Test
+            self._test(self.config.iterations)
+
+            if self.writer:
+                self.writer.close()
+        finally:
+            if self.energy_tracker:
+                self.energy_tracker.summary()
+                self.energy_tracker.close()
+                self.energy_tracker = None
     
     def train_step(self, iteration: int) -> Dict[str, float]:
         """
@@ -278,12 +313,15 @@ class Trainer:
         self._update_sh_degree(iteration)
         timing['lr_sh_ms'] = (time.perf_counter() - t0) * 1000.0
         
-        # Ensure camera data is on GPU (safe for multiprocessing)
-        # This handles both images and transformation matrices
-        # IMPORTANT: Use copy to avoid modifying persistent dataset objects when using 0 workers
-        import copy
+        # Move camera tensors to GPU.
+        # camera.to("cuda") is called unconditionally:
+        #   - First visit to a camera: moves CPU transforms to CUDA (lazily, in-place on the
+        #     cached dataset object — safe with num_workers=0, no-op on CUDA images).
+        #   - Subsequent visits: transforms are already CUDA, so .to() returns the same tensor
+        #     with no data movement.
+        # copy.copy() is intentionally omitted: it was 1-2ms overhead and is unnecessary with
+        # num_workers=0 since in-place mutation of the cached camera is harmless.
         t0 = time.perf_counter()
-        camera = copy.copy(camera)
         camera.to("cuda")
         timing['camera_to_cuda_ms'] = (time.perf_counter() - t0) * 1000.0
         
@@ -469,26 +507,10 @@ class Trainer:
                 loss += weight * Ll1depth_pure
         timing['depth_reg_ms'] = (time.perf_counter() - t0) * 1000.0
         
-        # 7. Backward Pass (fine-grained timing)
+        # 7. Backward Pass
         t_bw_total_start = time.perf_counter()
-        # sync before backward to capture any pending CUDA work
-        torch.cuda.synchronize()
-        t_sync_before = time.perf_counter()
-        timing['backward_sync_before_ms'] = (t_sync_before - t_bw_total_start) * 1000.0
-
-        # actual autograd compute
-        t_bw_compute_start = time.perf_counter()
         loss.backward()
-        t_bw_compute_end = time.perf_counter()
-        timing['backward_compute_ms'] = (t_bw_compute_end - t_bw_compute_start) * 1000.0
-
-        # sync after backward to ensure kernels finished
-        torch.cuda.synchronize()
-        t_sync_after = time.perf_counter()
-        timing['backward_sync_after_ms'] = (t_sync_after - t_bw_compute_end) * 1000.0
-
-        # total backward time (preserves existing metric)
-        timing['backward_ms'] = (t_sync_after - t_bw_total_start) * 1000.0
+        timing['backward_ms'] = (time.perf_counter() - t_bw_total_start) * 1000.0
 
         # 8. Adaptive Control (Densification, Pruning, Relocation)
         with torch.no_grad():
@@ -830,6 +852,18 @@ class Trainer:
                 self.writer.add_scalar('DynamicWeight/multiplier_mean', metrics['dynamic_multiplier_mean'], iteration)
             if 'dynamic_multiplier_max' in metrics:
                 self.writer.add_scalar('DynamicWeight/multiplier_max', metrics['dynamic_multiplier_max'], iteration)
+            energy_keys = (
+                # 每 iteration 能耗（J）
+                'energy/cpu_pkg_J', 'energy/cpu_core_J',
+                'energy/gpu_J', 'energy/total_J',
+                # 每 iteration 实时功耗（W）
+                'energy/cpu_pkg_power_W', 'energy/gpu_power_W', 'energy/total_power_W',
+                # 训练累计能耗（J）
+                'energy/cumulative_cpu_J', 'energy/cumulative_gpu_J', 'energy/cumulative_total_J',
+            )
+            for key in energy_keys:
+                if key in metrics:
+                    self.writer.add_scalar(key, metrics[key], iteration)
         
         # History
         self.stats['loss_history'].append(metrics['loss'])

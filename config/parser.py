@@ -60,7 +60,9 @@ def parse_args():
     parser.add_argument("--test_only", action="store_true", help="Test mode only")
     parser.add_argument("--save_checkpoint", action="store_true", help="Save .pth checkpoints periodically")
     parser.add_argument("--no_save_ply", action="store_true", help="Disable periodic PLY saving")
-    
+    parser.add_argument("--power_monitoring", action="store_true",
+                        help="Enable per-iteration energy monitoring via CPU RAPL + GPU NVML (default: off)")
+
     return parser.parse_args()
 
 
@@ -145,7 +147,9 @@ def merge_configs(yaml_config: dict, args: argparse.Namespace) -> dict:
         config['trainer']['save_checkpoint'] = True
     if args.no_save_ply:
         config['trainer']['save_ply'] = False
-        
+    if args.power_monitoring:
+        config['trainer']['power_monitoring'] = True
+
     return config
 
 
@@ -244,6 +248,7 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         dynamic_duration_static=trainer_dict.get('dynamic_duration_static', 0.5),
         dynamic_duration_dynamic=trainer_dict.get('dynamic_duration_dynamic', 0.1),
         dynamic_mask_threshold=trainer_dict.get('dynamic_mask_threshold', 0.5),
+        power_monitoring=trainer_dict.get('power_monitoring', False),
     )
     
     return data_config, model_config, optim_config, pipeline_config, trainer_config, config_dict
