@@ -417,11 +417,13 @@ class FreeTimeGaussianModel(GaussianModel):
         self.register_buffer('t_extent', torch.tensor(1.0, device=device))
         self.register_buffer('t_start', torch.tensor(0.0, device=device))
         
-        # Register extra activations
+        # Register extra activations (gate always registered; param created only when enabled)
+        _gamma = getattr(config, 'gate_sharpness', 20.0)
         self._param_activations.update({
             't_scale': lambda x: torch.exp(x),
             't': lambda x: x,
             'motion': lambda x: x,
+            'gate': lambda x, g=_gamma: torch.sigmoid(g * x),
         })
         
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float = 1.0, time_info: Optional[Dict] = None):
@@ -503,6 +505,14 @@ class FreeTimeGaussianModel(GaussianModel):
         else:
              self._gaussian_params['motion'] = nn.Parameter(torch.zeros((num_points, 3), device=self.device), requires_grad=True)
 
+        # FreeTimeGS++ Gated Marginalization: learnable persistence gate g_i ∈ (0,1)
+        # g_i→1: persistent/static background; g_i→0: transient/dynamic (original behavior)
+        # Initialize to 0 → sigmoid(γ·0)=0.5 (neutral); optimization drives it toward 0 or 1
+        if getattr(self.config, 'gated_marginalization', False):
+            self._gaussian_params['gate'] = nn.Parameter(
+                torch.zeros((num_points, 1), device=self.device), requires_grad=True
+            )
+
     def _load_extra_ply_data(self, plydata, num_points):
         # Helper
         def create_param(data_np):
@@ -529,12 +539,24 @@ class FreeTimeGaussianModel(GaussianModel):
         else:
             self._gaussian_params['motion'] = nn.Parameter(torch.zeros((num_points, 3), device=self.device), requires_grad=True)
 
+        # FreeTimeGS++ gate: load from PLY if present, else initialize if enabled
+        prop_names = [p.name for p in plydata['vertex'].properties]
+        if 'gate' in prop_names:
+            gate = np.asarray(plydata['vertex']['gate'])[..., None].astype(np.float32)
+            self._gaussian_params['gate'] = create_param(gate)
+        elif getattr(self.config, 'gated_marginalization', False):
+            self._gaussian_params['gate'] = nn.Parameter(
+                torch.zeros((num_points, 1), device=self.device), requires_grad=True
+            )
+
     def _add_extra_ply_dtype(self, dtype_list: List):
         dtype_list.append(('t', 'f4'))
         dtype_list.append(('t_scale', 'f4'))
         dtype_list.append(('motion_0', 'f4'))
         dtype_list.append(('motion_1', 'f4'))
         dtype_list.append(('motion_2', 'f4'))
+        if 'gate' in self._gaussian_params:
+            dtype_list.append(('gate', 'f4'))
 
     def _fill_extra_ply_data(self, vertex_data):
         def get_tensor(key):
@@ -553,15 +575,15 @@ class FreeTimeGaussianModel(GaussianModel):
             # Un-normalize for saving (0-1 -> Seconds)
             t_extent = self.t_extent.item()
             t_start = self.t_start.item()
-            
+
             # t_sec = t_norm * t_extent + t_start
             vertex_data['t'] = t[:, 0] * t_extent + t_start
-            
+
             # t_scale (duration): scale * t_extent
             # log(scale * t_extent) = log(scale) + log(t_extent)
             # Assuming params are log-scale, we add log(t_extent)
             vertex_data['t_scale'] = t_scale[:, 0] + np.log(t_extent)
-            
+
             # Motion: v_sec = v_norm / t_extent
             vertex_data['motion_0'] = motion[:, 0] / t_extent
             vertex_data['motion_1'] = motion[:, 1] / t_extent
@@ -573,6 +595,11 @@ class FreeTimeGaussianModel(GaussianModel):
             vertex_data['motion_0'] = motion[:, 0]
             vertex_data['motion_1'] = motion[:, 1]
             vertex_data['motion_2'] = motion[:, 2]
+
+        # Gate: save raw logit (activation is applied at query time)
+        if 'gate' in self._gaussian_params:
+            gate_raw = self._gaussian_params['gate'].detach().cpu().numpy()
+            vertex_data['gate'] = gate_raw[:, 0]
 
     def get_param_groups(self, optim_config) -> List[Dict]:
         groups = super().get_param_groups(optim_config)
@@ -593,6 +620,13 @@ class FreeTimeGaussianModel(GaussianModel):
                 'name': "velocity"
             }
         ])
+        if 'gate' in self._gaussian_params:
+            gate_lr = getattr(optim_config, 'gate_lr', 0.0001)
+            groups.append({
+                'params': [self._gate],
+                'lr': gate_lr,
+                'name': "gate"
+            })
         return groups
 
     def get_at_time(self, timestamp: float, opacity_threshold: float = 0.001) -> Dict[str, torch.Tensor]:
@@ -615,9 +649,17 @@ class FreeTimeGaussianModel(GaussianModel):
         xyz_at_t = mu_x + v * delta_t  # [N, 3]
         # xyz_at_t = mu_x 
         
-        # 5. Calculate temporal opacity weight
-        # s is duration (standard deviation)
-        temporal_weight = torch.exp(-0.5 * (delta_t / (s + 1e-7)) ** 2)  # [N, 1]
+        # 5. Temporal opacity weight
+        # Gated Marginalization (FreeTimeGS++):
+        #   ϕ(t) = g + (1-g) * exp(-0.5*(Δt/s)²)
+        #   g→1: persistent/static (always visible); g→0: transient (original formula)
+        # Falls back to original formula if gate param not present.
+        transient_weight = torch.exp(-0.5 * (delta_t / (s + 1e-7)) ** 2)  # [N, 1]
+        if 'gate' in self._gaussian_params:
+            g = self.get_gate.float()  # [N, 1], in (0, 1) via sigmoid(γ·logit)
+            temporal_weight = g + (1.0 - g) * transient_weight
+        else:
+            temporal_weight = transient_weight
         
         # 6. Modulate opacity
         base_opacity = self.get_opacity.float()  # [N, 1]
@@ -632,59 +674,6 @@ class FreeTimeGaussianModel(GaussianModel):
             'temporal_weight': temporal_weight,
             'mask': mask
         }
-
-    def relocate(self, mask: torch.Tensor, new_xyz: torch.Tensor, timestamp: float, new_motion: Optional[torch.Tensor] = None):
-        """
-        Relocate masked gaussians to new positions and reset their temporal attributes.
-        Used for periodic relocation in FreeTimeGS.
-        
-        Args:
-           mask: Boolean mask of gaussians to relocate [N]
-           new_xyz: New 3D positions for these gaussians [M, 3] where M = mask.sum()
-           timestamp: Current time to set as new mu_t
-           new_motion: New velocity for these gaussians [M, 3]. If None, resets to 0.
-        """
-        if mask.sum() == 0:
-            return
-
-        # 1. Reset Position (XYZ) to new locations
-        # Note: Optimizer update is handled by replace_tensor_to_optimizer in densifier usually, 
-        # but here we might just modify the tensor data if the optimizer link is preserved,
-        # OR we rely on the densifier to handle the parameter replacement.
-        # However, standard densification acts on *shapes*. Relocation modifies existing values.
-        # If we just change .data, Adam states (momentum) are stale. 
-        # Ideally we should zero out their momentum.
-        
-        # For simplicity and speed in this specific implementation:
-        # We assume this is called *during* densification logic where we might handle optimization updates.
-        # But if called standalone, we must be careful.
-        # The prompt implies a method on the model.
-        
-        # Update XYZ
-        optimizable_tensors = {}
-        
-        # Direct data modification (simplest, though momentum might push it away initially)
-        self._xyz[mask] = new_xyz.to(self.device)
-        
-        # 2. Reset Time (mu_t) -> Current Time
-        self._t[mask] = timestamp
-        
-        # 3. Reset Motion -> Inherited velocity or 0
-        if new_motion is not None:
-             self._motion[mask] = new_motion.to(self.device)
-        else:
-             self._motion[mask] = 0.0
-
-        
-        # 4. Reset Opacity -> slightly increased to survive execution
-        # inverse_sigmoid(0.5) is 0.0. inverse_sigmoid(0.1) is -2.19
-        new_opacity = inverse_sigmoid(0.1 * torch.ones(mask.sum(), 1, device=self.device))
-        self._opacity[mask] = new_opacity
-        
-        # 5. Reset Duration -> random small duration, rand*2 -> [0,2]. -3 -> [-3, -1]. Correct.
-        n_relocated = mask.sum()
-        random_tscales = (torch.rand(n_relocated, 1, device="cuda") * 2.0) - 3.0 
-        self._t_scale[mask] = random_tscales
 
 
 def detect_mode_from_ply(ply_path: str) -> str:

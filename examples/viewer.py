@@ -36,6 +36,14 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# On Linux, GTK may fail to find the gdk-pixbuf loaders cache, causing a hard
+# crash when GLFW triggers GTK icon loading. Point it to the known location if
+# the env var is not already set.
+if sys.platform.startswith('linux') and not os.environ.get('GDK_PIXBUF_MODULE_FILE'):
+    _candidate = '/usr/lib64/gdk-pixbuf-2.0/2.10.0/loaders.cache'
+    if os.path.isfile(_candidate):
+        os.environ['GDK_PIXBUF_MODULE_FILE'] = _candidate
+
 from core.gaussian_model import GaussianModel, FreeTimeGaussianModel, detect_mode_from_ply
 from core.renderer import GaussianRenderer
 from config.config import ModelConfig, PipelineConfig

@@ -1,13 +1,13 @@
 # Configuration for SelfCap PCD initialization
 
 # Base Paths (Required)
-source_path: "/media/data/freetimegs/data/corgi-release"
-output_path: "/media/data/freetimegs/data/corgi-release/points3d.ply"
+source_path: "/media/data/freetimegs/data/bar-release"
+output_path: "/media/data/freetimegs/data/bar-release/points3d.ply"
 pcd_subfolder: "pcds"
 
 # Frame Processing Range
-start_frame: 2950
-end_frame: 3010
+start_frame: 3420
+end_frame: 3480
 downsample_rate: 1
 fps: 60.0
 
