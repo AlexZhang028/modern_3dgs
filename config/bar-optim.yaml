@@ -6,7 +6,7 @@ data:
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: /media/data/freetimegs/res/bar/01
+  model_path: /media/data/freetimegs/res/bar/04
   normalized_t: false
   num_workers: 0
   pin_memory: true

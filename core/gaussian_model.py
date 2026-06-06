@@ -507,10 +507,11 @@ class FreeTimeGaussianModel(GaussianModel):
 
         # FreeTimeGS++ Gated Marginalization: learnable persistence gate g_i ∈ (0,1)
         # g_i→1: persistent/static background; g_i→0: transient/dynamic (original behavior)
-        # Initialize to 0 → sigmoid(γ·0)=0.5 (neutral); optimization drives it toward 0 or 1
+        # Initialize to -0.5 → sigmoid(γ·-0.5)≈0 so temporal_weight≈exp(...) at startup,
+        # matching the no-gate baseline; optimization then drives static Gaussians toward 1.
         if getattr(self.config, 'gated_marginalization', False):
             self._gaussian_params['gate'] = nn.Parameter(
-                torch.zeros((num_points, 1), device=self.device), requires_grad=True
+                torch.full((num_points, 1), -0.5, device=self.device), requires_grad=True
             )
 
     def _load_extra_ply_data(self, plydata, num_points):
@@ -546,7 +547,7 @@ class FreeTimeGaussianModel(GaussianModel):
             self._gaussian_params['gate'] = create_param(gate)
         elif getattr(self.config, 'gated_marginalization', False):
             self._gaussian_params['gate'] = nn.Parameter(
-                torch.zeros((num_points, 1), device=self.device), requires_grad=True
+                torch.full((num_points, 1), -0.5, device=self.device), requires_grad=True
             )
 
     def _add_extra_ply_dtype(self, dtype_list: List):

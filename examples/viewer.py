@@ -254,6 +254,42 @@ class ObitControl:
 # Helper Functions
 # =============================================================================
 
+def cam_to_c2w(cam) -> np.ndarray:
+    """Reconstruct 4x4 C2W matrix from a dataset Camera.
+
+    Camera.R stores the C2W rotation (= transpose of W2C rotation).
+    Camera.camera_center stores the camera position in world coordinates.
+    """
+    c2w = np.eye(4)
+    c2w[:3, :3] = cam.R
+    c2w[:3, 3] = cam.camera_center.cpu().numpy()
+    return c2w
+
+
+def interpolate_cameras(c2w_a: np.ndarray, c2w_b: np.ndarray, n_frames: int):
+    """Return n_frames C2W matrices interpolated between c2w_a and c2w_b.
+
+    Rotation uses SLERP; translation uses LERP.
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+
+    rot_a = Rotation.from_matrix(c2w_a[:3, :3])
+    rot_b = Rotation.from_matrix(c2w_b[:3, :3])
+    slerp = Slerp([0.0, 1.0], Rotation.concatenate([rot_a, rot_b]))
+
+    pos_a = c2w_a[:3, 3]
+    pos_b = c2w_b[:3, 3]
+
+    result = []
+    for i in range(n_frames):
+        t = i / (n_frames - 1) if n_frames > 1 else 0.0
+        c2w = np.eye(4, dtype=np.float64)
+        c2w[:3, :3] = slerp(t).as_matrix()
+        c2w[:3, 3] = (1.0 - t) * pos_a + t * pos_b
+        result.append(c2w)
+    return result
+
+
 def estimate_camera_init(gaussians: GaussianModel) -> Tuple[np.ndarray, float]:
     """
     Estimate initial camera position and radius based on scene bounds.
@@ -606,7 +642,11 @@ def main():
     
     # Optional arguments for rendering specific camera from dataset
     parser.add_argument("--source_path", type=str, default="", help="Path to dataset root (Req if --cam is used)")
-    parser.add_argument("--cam", type=str, default=None, help="Name of the camera to render from dataset, e.g., '0007'")
+    parser.add_argument("--cam", type=str, nargs='+', default=None,
+                        help="Camera name(s) from dataset. Single: render that camera's frames. "
+                             "Two (e.g. --cam 01 02): interpolate between those two cameras.")
+    parser.add_argument("--interp_frames", type=int, default=60,
+                        help="Number of frames when interpolating between two cameras (default 60)")
     parser.add_argument("--output_gt", action="store_true", help="If set and --cam is used, output GT video as well")
     parser.add_argument("--resolution", type=int, default=1, help="Dataset resolution factor (1, 2, 4, 8) if rendering --cam")
     parser.add_argument("--start_frame", type=int, default=0, help="Start frame for rendering dataset (only applies to --cam)")
@@ -647,31 +687,110 @@ def main():
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
             
-        if args.cam:
-            print(f"Rendering Specific Camera '{args.cam}' from {args.source_path}...")
+        if args.cam and len(args.cam) == 2:
+            # ── Two-camera interpolation mode ──────────────────────────────
+            cam_name_a, cam_name_b = args.cam
+            print(f"Interpolating between cameras '{cam_name_a}' and '{cam_name_b}'...")
             from core.builder import setup_dataset
             from config.config import DataConfig
-            
+
             if not args.source_path:
                 print("Error: --source_path is required when using --cam")
                 return
-                
+
+            def _load_first_cam(cam_name):
+                dc = DataConfig(
+                    source_path=args.source_path,
+                    resolution=args.resolution,
+                    eval=True,
+                    test_cameras=[cam_name],
+                    start_frame=args.start_frame,
+                    end_frame=args.end_frame,
+                    use_tmp=False,
+                    cache_images=False,
+                    lazy_loading=True,
+                    inference_only=True,
+                )
+                ds = setup_dataset(dc, split="test")
+                if not ds or len(ds) == 0:
+                    print(f"Error: No frames found for camera '{cam_name}'")
+                    return None
+                sorted_idx = sorted(range(len(ds)), key=lambda i: ds.cameras[i].timestamp)
+                return ds.cameras[sorted_idx[0]]
+
+            cam_a = _load_first_cam(cam_name_a)
+            cam_b = _load_first_cam(cam_name_b)
+            if cam_a is None or cam_b is None:
+                return
+
+            c2w_list = interpolate_cameras(cam_to_c2w(cam_a), cam_to_c2w(cam_b), args.interp_frames)
+
+            render_w = cam_a.width
+            render_h = cam_a.height
+            fov_x_deg = np.degrees(cam_a.FovX)
+
+            # Temporal interpolation range (dynamic models only)
+            t_start = args.start_time if args.start_time >= 0 else (cam_a.timestamp or 0.0)
+            t_end   = args.end_time   if args.end_time   >= 0 else (cam_b.timestamp or t_start)
+
+            out_path = f"{args.output}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            interp_out = cv2.VideoWriter(out_path, fourcc, args.fps, (render_w, render_h))
+            bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+
+            if mode == "freetime":
+                print(f"Rendering {args.interp_frames} interpolated frames "
+                      f"({render_w}x{render_h}), cam {cam_name_a}→{cam_name_b}, "
+                      f"t {t_start:.4f}→{t_end:.4f}...")
+            else:
+                print(f"Rendering {args.interp_frames} interpolated frames "
+                      f"({render_w}x{render_h}), cam {cam_name_a}→{cam_name_b}...")
+
+            for idx, c2w in enumerate(tqdm(c2w_list)):
+                alpha = idx / (args.interp_frames - 1) if args.interp_frames > 1 else 0.0
+                interp_cam = SimpleCamera(render_w, render_h, fov_x_deg, device=args.device)
+                interp_cam.update_pose(c2w)
+                with torch.no_grad():
+                    if mode == "freetime":
+                        render_t = (1.0 - alpha) * t_start + alpha * t_end
+                        out_dict = renderer(gaussians, interp_cam, bg_color,
+                                            timestamp=render_t, enable_culling=True)
+                    else:
+                        out_dict = renderer(gaussians, interp_cam, bg_color)
+                img_render = out_dict['render'].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                interp_out.write(cv2.cvtColor((img_render * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                del out_dict, img_render
+
+            interp_out.release()
+            print(f"Interpolation video saved to {out_path}")
+
+        elif args.cam:
+            # ── Single-camera dataset render (existing behaviour) ──────────
+            cam_name = args.cam[0]
+            print(f"Rendering Specific Camera '{cam_name}' from {args.source_path}...")
+            from core.builder import setup_dataset
+            from config.config import DataConfig
+
+            if not args.source_path:
+                print("Error: --source_path is required when using --cam")
+                return
+
             data_config = DataConfig(
                 source_path=args.source_path,
                 resolution=args.resolution,
                 eval=True,
-                test_cameras=[args.cam],
+                test_cameras=[cam_name],
                 start_frame=args.start_frame,
                 end_frame=args.end_frame,
-                use_tmp=args.output_gt,       # 如果不需要 GT，就不要去抽取所有帧
-                cache_images=False, # 防止加载时把图片缓存到内存中
-                lazy_loading=True, # 防止默认行为把全部数据读到内存
+                use_tmp=args.output_gt,
+                cache_images=False,
+                lazy_loading=True,
                 inference_only=not args.output_gt
             )
             dataset = setup_dataset(data_config, split="test")
-            
+
             if not dataset or len(dataset) == 0:
-                print(f"Error: No frames found for camera '{args.cam}'")
+                print(f"Error: No frames found for camera '{cam_name}'")
                 return
                 
             # sort by time
