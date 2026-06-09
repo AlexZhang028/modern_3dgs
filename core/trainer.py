@@ -226,25 +226,13 @@ class Trainer:
         else:
             raise ValueError(f"Unknown training mode: {self.mode}")
     
-    # ---- Classification helpers (gate-first, t_scale fallback) ----
-
     def _get_static_mask(self) -> torch.Tensor:
-        """Boolean mask [N]: True = static/persistent, False = dynamic/transient.
-        Uses gate parameter when gated_marginalization is active; falls back to
-        t_scale threshold so all classification is consistent across the codebase.
-        """
-        if 'gate' in self.model._gaussian_params:
-            return self.model.get_gate.squeeze() > 0.5
+        """Boolean mask [N]: True = static/persistent, False = dynamic/transient."""
         dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
         return self.model.get_t_scale.squeeze() > dur_thresh
 
     def _get_dynamic_score(self) -> torch.Tensor:
-        """Per-Gaussian dynamism score [N,1] in [0,1]: 0=static, 1=dynamic.
-        Used to render 2D dynamic weight maps for loss weighting and visualisation.
-        Uses gate when available; falls back to t_scale-based formula.
-        """
-        if 'gate' in self.model._gaussian_params:
-            return (1.0 - self.model.get_gate).detach()  # [N,1]
+        """Per-Gaussian dynamism score [N,1] in [0,1]: 0=static, 1=dynamic."""
         duration    = self.model.get_t_scale.detach()    # [N,1]
         static_dur  = getattr(self.config, 'dynamic_duration_static',  0.5)
         dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
@@ -1127,13 +1115,6 @@ class FreeTimeTrainer(Trainer):
         # else:
         l_reg = (base_opacity * temporal_weight.detach()).mean()
         loss += reg_weight * l_reg
-
-        # FreeTimeGS++ Gate regularization: penalize intermediate gate values (push toward 0 or 1)
-        # g*(1-g) = 0 at extremes, max 0.25 at g=0.5
-        if 'gate' in self.model._gaussian_params:
-            lambda_gate = getattr(self.config, 'lambda_gate', 0.001)
-            gate_val = self.model.get_gate.squeeze()
-            loss += lambda_gate * (gate_val * (1.0 - gate_val)).mean()
 
         if iteration > getattr(self.config, 'motion_blur_start_iter', 15000) and hasattr(self.model, '_motion') and self.model._motion is not None:
             speed = torch.norm(self.model._motion, dim=-1).detach()

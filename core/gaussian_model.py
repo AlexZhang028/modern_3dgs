@@ -417,13 +417,10 @@ class FreeTimeGaussianModel(GaussianModel):
         self.register_buffer('t_extent', torch.tensor(1.0, device=device))
         self.register_buffer('t_start', torch.tensor(0.0, device=device))
         
-        # Register extra activations (gate always registered; param created only when enabled)
-        _gamma = getattr(config, 'gate_sharpness', 20.0)
         self._param_activations.update({
             't_scale': lambda x: torch.exp(x),
             't': lambda x: x,
             'motion': lambda x: x,
-            'gate': lambda x, g=_gamma: torch.sigmoid(g * x),
         })
         
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float = 1.0, time_info: Optional[Dict] = None):
@@ -505,15 +502,6 @@ class FreeTimeGaussianModel(GaussianModel):
         else:
              self._gaussian_params['motion'] = nn.Parameter(torch.zeros((num_points, 3), device=self.device), requires_grad=True)
 
-        # FreeTimeGS++ Gated Marginalization: learnable persistence gate g_i ∈ (0,1)
-        # g_i→1: persistent/static background; g_i→0: transient/dynamic (original behavior)
-        # Initialize to -0.5 → sigmoid(γ·-0.5)≈0 so temporal_weight≈exp(...) at startup,
-        # matching the no-gate baseline; optimization then drives static Gaussians toward 1.
-        if getattr(self.config, 'gated_marginalization', False):
-            self._gaussian_params['gate'] = nn.Parameter(
-                torch.full((num_points, 1), -0.5, device=self.device), requires_grad=True
-            )
-
     def _load_extra_ply_data(self, plydata, num_points):
         # Helper
         def create_param(data_np):
@@ -540,24 +528,12 @@ class FreeTimeGaussianModel(GaussianModel):
         else:
             self._gaussian_params['motion'] = nn.Parameter(torch.zeros((num_points, 3), device=self.device), requires_grad=True)
 
-        # FreeTimeGS++ gate: load from PLY if present, else initialize if enabled
-        prop_names = [p.name for p in plydata['vertex'].properties]
-        if 'gate' in prop_names:
-            gate = np.asarray(plydata['vertex']['gate'])[..., None].astype(np.float32)
-            self._gaussian_params['gate'] = create_param(gate)
-        elif getattr(self.config, 'gated_marginalization', False):
-            self._gaussian_params['gate'] = nn.Parameter(
-                torch.full((num_points, 1), -0.5, device=self.device), requires_grad=True
-            )
-
     def _add_extra_ply_dtype(self, dtype_list: List):
         dtype_list.append(('t', 'f4'))
         dtype_list.append(('t_scale', 'f4'))
         dtype_list.append(('motion_0', 'f4'))
         dtype_list.append(('motion_1', 'f4'))
         dtype_list.append(('motion_2', 'f4'))
-        if 'gate' in self._gaussian_params:
-            dtype_list.append(('gate', 'f4'))
 
     def _fill_extra_ply_data(self, vertex_data):
         def get_tensor(key):
@@ -597,11 +573,6 @@ class FreeTimeGaussianModel(GaussianModel):
             vertex_data['motion_1'] = motion[:, 1]
             vertex_data['motion_2'] = motion[:, 2]
 
-        # Gate: save raw logit (activation is applied at query time)
-        if 'gate' in self._gaussian_params:
-            gate_raw = self._gaussian_params['gate'].detach().cpu().numpy()
-            vertex_data['gate'] = gate_raw[:, 0]
-
     def get_param_groups(self, optim_config) -> List[Dict]:
         groups = super().get_param_groups(optim_config)
         groups.extend([
@@ -621,13 +592,6 @@ class FreeTimeGaussianModel(GaussianModel):
                 'name': "velocity"
             }
         ])
-        if 'gate' in self._gaussian_params:
-            gate_lr = getattr(optim_config, 'gate_lr', 0.0001)
-            groups.append({
-                'params': [self._gate],
-                'lr': gate_lr,
-                'name': "gate"
-            })
         return groups
 
     def get_at_time(self, timestamp: float, opacity_threshold: float = 0.001) -> Dict[str, torch.Tensor]:
@@ -650,17 +614,9 @@ class FreeTimeGaussianModel(GaussianModel):
         xyz_at_t = mu_x + v * delta_t  # [N, 3]
         # xyz_at_t = mu_x 
         
-        # 5. Temporal opacity weight
-        # Gated Marginalization (FreeTimeGS++):
-        #   ϕ(t) = g + (1-g) * exp(-0.5*(Δt/s)²)
-        #   g→1: persistent/static (always visible); g→0: transient (original formula)
-        # Falls back to original formula if gate param not present.
+        # 5. Temporal opacity weight: exp(-0.5*(Δt/s)²)
         transient_weight = torch.exp(-0.5 * (delta_t / (s + 1e-7)) ** 2)  # [N, 1]
-        if 'gate' in self._gaussian_params:
-            g = self.get_gate.float()  # [N, 1], in (0, 1) via sigmoid(γ·logit)
-            temporal_weight = g + (1.0 - g) * transient_weight
-        else:
-            temporal_weight = transient_weight
+        temporal_weight = transient_weight
         
         # 6. Modulate opacity
         base_opacity = self.get_opacity.float()  # [N, 1]

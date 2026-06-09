@@ -245,9 +245,7 @@ class GaussianDensifier:
              new_params['_t_scale'] = self.model._t_scale[selected_pts_mask].repeat(N, 1)
         if hasattr(self.model, '_motion') and self.model._motion is not None:
              new_params['_motion'] = self.model._motion[selected_pts_mask].repeat(N, 1)
-        if 'gate' in self.model._gaussian_params:
-             new_params['_gate'] = self.model._gaussian_params['gate'][selected_pts_mask].repeat(N, 1)
-        
+
         # Add new Gaussians
         self._add_gaussians(new_params)
         
@@ -379,8 +377,6 @@ class GaussianDensifier:
              params['_t_scale'] = self.model._t_scale[mask]
         if hasattr(self.model, '_motion') and self.model._motion is not None:
              params['_motion'] = self.model._motion[mask]
-        if 'gate' in self.model._gaussian_params:
-             params['_gate'] = self.model._gaussian_params['gate'][mask]
 
         return params
     
@@ -402,7 +398,6 @@ class GaussianDensifier:
             '_t': 't',
             '_t_scale': 't_scale',
             '_motion': 'velocity',
-            '_gate': 'gate',
         }
 
         # Prepare dictionary for optimizer (group_name -> tensor)
@@ -461,7 +456,6 @@ class GaussianDensifier:
             't': '_t',
             't_scale': '_t_scale',
             'velocity': '_motion',
-            'gate': '_gate',
         }
         
         # Map back from group name to model attribute name
@@ -780,8 +774,5 @@ class FreeTimeDensificationScheduler(DensificationScheduler):
                 self.model._motion.data[donor_indices] = (
                     self.model._motion.data[receptor_indices] + vel_noise
                 )
-            if 'gate' in self.model._gaussian_params:
-                self.model._gate.data[donor_indices] = self.model._gate.data[receptor_indices]
-
         self.optimizer.reset_optimizer_state(final_mask)
 

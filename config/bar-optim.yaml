@@ -49,9 +49,6 @@ model:
   mode: freetime
   percent_dense: 0.01
   sh_degree: 3
-  gated_marginalization: true   # FreeTimeGS++: learnable gate replaces hard t_scale threshold
-  gate_sharpness: 20.0
-
 optim:
   feature_lr: 0.0025
   iterations: 50000
@@ -77,10 +74,10 @@ trainer:
   # Dynamic region focus weighting
   dynamic_weighting_enabled: true
   dynamic_boost_start_iter: 15000
-  dynamic_boost_end_iter: 30000
+  dynamic_boost_end_iter: 20000
   # How often (in iterations) to update per-view dynamic weight cache
   dynamic_weight_cache_update_interval: 10000
-  max_dynamic_boost: 10.0
+  max_dynamic_boost: 5.0
   dynamic_boost_curve_power: 3.0
   dynamic_duration_static: 0.5
   dynamic_duration_dynamic: 0.1
@@ -90,8 +87,6 @@ trainer:
   color_correction_enabled: true   # per-camera affine scale+bias, reduces run-to-run variance
   cc_lr: 0.001
   lambda_cc: 0.001
-  lambda_gate: 0.001              # gate bimodality regularization
-
   # Phase-based decoupled training
   # Phase 1 (0-15k):   joint training, establishes static/dynamic separation
   # Phase 2 (15k-30k): dynamic focus, static Gaussian grads zeroed + dynamic boost active

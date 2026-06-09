@@ -50,9 +50,6 @@ model:
   mode: freetime
   percent_dense: 0.01
   sh_degree: 3
-  gated_marginalization: true   # FreeTimeGS++: learnable gate replaces hard t_scale threshold
-  gate_sharpness: 20.0
-
 optim:
   feature_lr: 0.0025
   iterations: 50000
@@ -91,8 +88,6 @@ trainer:
   color_correction_enabled: true   # per-camera affine scale+bias, reduces run-to-run variance
   cc_lr: 0.001
   lambda_cc: 0.001
-  lambda_gate: 0.001              # gate bimodality regularization
-
   # Phase-based decoupled training
   # Phase 1 (0-15k):   joint training, establishes static/dynamic separation
   # Phase 2 (15k-30k): dynamic focus, static Gaussian grads zeroed + dynamic boost active
