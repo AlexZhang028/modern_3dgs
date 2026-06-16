@@ -633,28 +633,152 @@ class FreeTimeGaussianModel(GaussianModel):
         }
 
 
+class SharpTimeGaussianModel(FreeTimeGaussianModel):
+    """
+    SharpTimeGS model (arXiv 2602.02989).
+
+    Extends FreeTimeGaussianModel with two key changes:
+      1. Flat-top temporal visibility: opacity stays at 1 inside a learnable
+         lifespan radius r, then falls off as Gaussian outside.
+      2. Lifespan-modulated motion: effective velocity is divided by
+         f(σ_t, r) = 1 + max(1, (σ_t + r)²), suppressing drift for
+         long-lived static Gaussians without forcing v ≈ 0 explicitly.
+
+    New parameter: r  (lifespan radius, [N,1], softplus-activated, ≥ 0)
+    """
+
+    # softplus^(-1)(1e-6) ≈ ln(exp(1e-6)-1) ≈ ln(1e-6) ≈ -13.816
+    _R_INIT_LOGIT: float = -13.816
+
+    def __init__(self, config: ModelConfig, device: str = "cuda"):
+        super().__init__(config, device)
+        self.mode = "sharptime"
+        self._param_activations['r'] = lambda x: torch.nn.functional.softplus(x)
+
+    # ------------------------------------------------------------------ #
+    #  Initialization                                                      #
+    # ------------------------------------------------------------------ #
+
+    def create_from_pcd(
+        self,
+        pcd: BasicPointCloud,
+        spatial_lr_scale: float = 1.0,
+        time_info: Optional[Dict] = None,
+    ):
+        super().create_from_pcd(pcd, spatial_lr_scale, time_info)
+        num_points = self.num_points
+        self._gaussian_params['r'] = nn.Parameter(
+            torch.full((num_points, 1), self._R_INIT_LOGIT, device=self.device),
+            requires_grad=True,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  PLY I/O                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _load_extra_ply_data(self, plydata, num_points):
+        super()._load_extra_ply_data(plydata, num_points)
+        prop_names = [p.name for p in plydata['vertex'].properties]
+        if 'r' in prop_names:
+            r_raw = np.asarray(plydata['vertex']['r'])[..., None].astype(np.float32)
+            self._gaussian_params['r'] = nn.Parameter(
+                torch.from_numpy(r_raw).float().to(self.device), requires_grad=True
+            )
+        else:
+            self._gaussian_params['r'] = nn.Parameter(
+                torch.full((num_points, 1), self._R_INIT_LOGIT, device=self.device),
+                requires_grad=True,
+            )
+
+    def _add_extra_ply_dtype(self, dtype_list: List):
+        super()._add_extra_ply_dtype(dtype_list)
+        dtype_list.append(('r', 'f4'))
+
+    def _fill_extra_ply_data(self, vertex_data):
+        super()._fill_extra_ply_data(vertex_data)
+        vertex_data['r'] = self._gaussian_params['r'].detach().cpu().numpy()[:, 0]
+
+    # ------------------------------------------------------------------ #
+    #  Optimizer groups                                                    #
+    # ------------------------------------------------------------------ #
+
+    def get_param_groups(self, optim_config) -> List[Dict]:
+        groups = super().get_param_groups(optim_config)
+        groups.append({
+            'params': [self._r],
+            'lr': getattr(optim_config, 'r_lr', 0.001),
+            'name': 'r',
+        })
+        return groups
+
+    # ------------------------------------------------------------------ #
+    #  Temporal rendering                                                  #
+    # ------------------------------------------------------------------ #
+
+    def get_at_time(
+        self, timestamp: float, opacity_threshold: float = 0.001
+    ) -> Dict[str, torch.Tensor]:
+        mu_x  = self.get_xyz.float()       # [N, 3]
+        mu_t  = self.get_t.float()         # [N, 1]
+        sigma = self.get_t_scale.float()   # [N, 1]  σ_t = exp(t_scale_logit)
+        v     = self.get_motion.float()    # [N, 3]
+        r     = self.get_r.float()         # [N, 1]  r = softplus(r_logit) ≥ 0
+
+        delta_t  = timestamp - mu_t        # [N, 1]
+        abs_dt   = torch.abs(delta_t)      # [N, 1]
+
+        # ---- Lifespan-modulated motion (eq. 1) ----
+        # f(σ_t, r) = 1 + max(1, (σ_t + r)²)
+        f       = 1.0 + torch.clamp((sigma + r) ** 2, min=1.0)  # [N, 1]
+        xyz_at_t = mu_x + (v / f) * delta_t                      # [N, 3]
+
+        # ---- Flat-top temporal visibility (eq. 2) ----
+        # l(t) = 1                              if |Δt| ≤ r
+        #        exp(-((|Δt|-r)/σ_t)²)          if |Δt| > r
+        outer        = (abs_dt - r).clamp(min=0.0)               # [N, 1]
+        temporal_weight = torch.where(
+            abs_dt <= r,
+            torch.ones_like(abs_dt),
+            torch.exp(-(outer / (sigma + 1e-7)) ** 2),
+        )                                                         # [N, 1]
+
+        base_opacity = self.get_opacity.float()                   # [N, 1]
+        opacity_at_t = base_opacity * temporal_weight             # [N, 1]
+
+        mask = opacity_at_t.squeeze() > opacity_threshold         # [N]
+
+        return {
+            'xyz_at_t':       xyz_at_t,
+            'opacity_at_t':   opacity_at_t,
+            'temporal_weight': temporal_weight,
+            'base_opacity':   base_opacity,
+            'mask':           mask,
+        }
+
+
 def detect_mode_from_ply(ply_path: str) -> str:
-    """
-    Auto-detect mode (static/freetime) from PLY file.
-    """
+    """Auto-detect mode (static / freetime / sharptime) from PLY file."""
     from plyfile import PlyData
-    
+
     plydata = PlyData.read(ply_path)
     vertex_names = [prop.name for prop in plydata['vertex'].properties]
-    
-    has_t = 't' in vertex_names
+
+    has_t      = 't' in vertex_names
     has_t_scale = 't_scale' in vertex_names
-    has_motion = any(name in vertex_names for name in ['motion_0', 'motion_1', 'motion_2'])
-    
+    has_motion = any(n in vertex_names for n in ['motion_0', 'motion_1', 'motion_2'])
+    has_r      = 'r' in vertex_names
+
+    if has_r:
+        return "sharptime"
     if has_t or has_t_scale or has_motion:
         return "freetime"
-    else:
-        return "static"
+    return "static"
 
 
 def create_model_from_config(config: ModelConfig, device: str = "cuda") -> GaussianModel:
     """Factory function to create the correct model type."""
+    if config.mode == "sharptime":
+        return SharpTimeGaussianModel(config, device)
     if config.mode == "freetime":
         return FreeTimeGaussianModel(config, device)
-    else:
-        return GaussianModel(config, device)
+    return GaussianModel(config, device)

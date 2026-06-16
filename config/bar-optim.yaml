@@ -6,7 +6,7 @@ data:
   images: images
   init_point_cloud_path: ''
   lazy_loading: true
-  model_path: /media/data/freetimegs/res/bar/04
+  model_path: /media/data/freetimegs/res/bar/05_remove_gate
   normalized_t: false
   num_workers: 0
   pin_memory: true
@@ -46,7 +46,7 @@ densify:
 iterations: 50000
 
 model:
-  mode: freetime
+  mode: sharptime
   percent_dense: 0.01
   sh_degree: 3
 optim:
@@ -61,6 +61,7 @@ optim:
   t_lr: 0.0001
   t_scale_lr: 0.005
   velocity_lr: 0.00016
+  r_lr: 0.001
   opacity_reset_until_iter: 11999
 
 trainer:

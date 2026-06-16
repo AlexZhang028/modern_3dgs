@@ -62,7 +62,7 @@ class ModelConfig:
     """
     # Basic Parameters
     sh_degree: int = 3  # SH degree (0-4)
-    mode: str = "static"  # Model type: "static" or "freetime"
+    mode: str = "static"  # Model type: "static", "freetime", or "sharptime"
     
     # Densification Parameters
     percent_dense: float = 0.01  # Percentage of scene extent for densification
@@ -73,8 +73,8 @@ class ModelConfig:
     normalized_t: bool = False # Use normalized time (0-1) or seconds
 
     def __post_init__(self):
-        assert self.mode in ["static", "freetime"], \
-            f"Mode must be 'static' or 'freetime', got '{self.mode}'"
+        assert self.mode in ["static", "freetime", "sharptime"], \
+            f"Mode must be 'static', 'freetime', or 'sharptime', got '{self.mode}'"
         assert 0 <= self.sh_degree <= 4, \
             f"SH degree must be between 0-4, got {self.sh_degree}"
 
@@ -107,6 +107,8 @@ class OptimConfig:
     t_lr: float = 0.0001
     t_scale_lr: float = 0.005
     velocity_lr: float = 0.00016
+    # SharpTimeGS Specific Learning Rates
+    r_lr: float = 0.001  # lifespan radius learning rate
     # Exposure Compensation Learning Rates
     exposure_lr_init: float = 0.01
     exposure_lr_final: float = 0.001
@@ -288,6 +290,9 @@ class TrainerConfig:
     # Phase 2 densification: lower threshold and higher N_split for dynamic Gaussians
     decouple_dynamic_densify_mult: float = 0.5   # grad threshold multiplier in Phase 2
     decouple_dynamic_n_split: int = 3             # N_split override for dynamic Gaussians in Phase 2
+
+    # SharpTimeGS Regularization
+    lambda_lifespan: float = 0.0  # L_t: encourages Gaussians to extend their lifespan (eq.7-8)
 
 # ============================================================================
 # Full Training Configuration

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from config.parser import parse_args, get_combined_configs, save_config
 from core.builder import setup_dataset, setup_model, setup_optimizer, setup_renderer
-from core.trainer import Trainer, FreeTimeTrainer
+from core.trainer import Trainer, FreeTimeTrainer, SharpTimeTrainer
 from utils.general_utils import seed_everything
 
 
@@ -113,7 +113,9 @@ def main():
     print("\nInitializing Trainer")
     
     # Factory Logic
-    if model.config.mode == "freetime":
+    if model.config.mode == "sharptime":
+        TrainerClass = SharpTimeTrainer
+    elif model.config.mode == "freetime":
         TrainerClass = FreeTimeTrainer
     else:
         TrainerClass = Trainer

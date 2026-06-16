@@ -1,7 +1,7 @@
 """
 Gaussian Splatting Trainer
 
-Unified training framework supporting both Static and FreeTime modes.
+Unified training framework supporting Static, FreeTime, and SharpTime modes.
 """
 
 import time
@@ -1127,4 +1127,53 @@ class FreeTimeTrainer(Trainer):
             phase = 1 if iteration <= joint_end else (2 if iteration <= dynamic_end else 3)
             self.writer.add_scalar('Decouple/phase', phase, iteration)
 
+
+class SharpTimeTrainer(FreeTimeTrainer):
+    """
+    Trainer for SharpTimeGS (arXiv 2602.02989).
+
+    Inherits all FreeTimeGS training infrastructure (temporal sampler,
+    gradient routing, dynamic weighting, MCMC relocation, etc.) and adds:
+
+      - L_t: lifespan regularization that encourages Gaussians to extend
+             their active duration, reducing fragmentation into many
+             short-lived primitives.
+    """
+
+    # ------------------------------------------------------------------ #
+    #  Loss hook                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _compute_loss_hook(
+        self, loss: torch.Tensor, rendered: Dict, iteration: int
+    ) -> torch.Tensor:
+        # Inherit FreeTimeGS 4D regularization (L_opacity equivalent)
+        loss = super()._compute_loss_hook(loss, rendered, iteration)
+
+        # L_t: lifespan regularization (SharpTimeGS eq. 7-8)
+        # L_t = 1/N Σ 1/√(-2·log(o_th)·σ_t² + r)
+        # Minimising this pushes σ_t and r to grow → longer-lived primitives.
+        lambda_t = getattr(self.config, 'lambda_lifespan', 0.0)
+        if lambda_t > 0.0:
+            o_th    = getattr(self.config, 'prune_opacity_threshold', 0.005)
+            sigma_t = self.model.get_t_scale  # [N,1], already exp-activated
+            r       = self.model.get_r        # [N,1], already softplus-activated
+            a       = -2.0 * math.log(max(float(o_th), 1e-8))
+            denom   = (a * sigma_t ** 2 + r).clamp(min=1e-8)
+            L_t     = (1.0 / torch.sqrt(denom)).mean()
+            loss    += lambda_t * L_t
+
+        return loss
+
+    # ------------------------------------------------------------------ #
+    #  Metrics logging                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _log_metrics(self, iteration: int, metrics: Dict[str, float]):
+        super()._log_metrics(iteration, metrics)
+        if self.writer:
+            r = self.model.get_r  # softplus-activated
+            self.writer.add_scalar('params/r_mean', r.mean().item(), iteration)
+            self.writer.add_scalar('params/r_max',  r.max().item(),  iteration)
+            self.writer.add_histogram('params/r', r, iteration)
 

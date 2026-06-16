@@ -238,13 +238,15 @@ class GaussianDensifier:
             '_opacity': self.model._opacity[selected_pts_mask].repeat(N, 1),
         }
         
-        # Copy FreeTimeGS parameters if present
+        # Copy FreeTimeGS / SharpTimeGS parameters if present
         if hasattr(self.model, '_t') and self.model._t is not None:
              new_params['_t'] = self.model._t[selected_pts_mask].repeat(N, 1)
         if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
              new_params['_t_scale'] = self.model._t_scale[selected_pts_mask].repeat(N, 1)
         if hasattr(self.model, '_motion') and self.model._motion is not None:
              new_params['_motion'] = self.model._motion[selected_pts_mask].repeat(N, 1)
+        if hasattr(self.model, '_r') and self.model._r is not None:
+             new_params['_r'] = self.model._r[selected_pts_mask].repeat(N, 1)
 
         # Add new Gaussians
         self._add_gaussians(new_params)
@@ -370,13 +372,15 @@ class GaussianDensifier:
             '_opacity': self.model._opacity[mask],
         }
         
-        # FreeTimeGS parameters
+        # FreeTimeGS / SharpTimeGS parameters
         if hasattr(self.model, '_t') and self.model._t is not None:
              params['_t'] = self.model._t[mask]
         if hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
              params['_t_scale'] = self.model._t_scale[mask]
         if hasattr(self.model, '_motion') and self.model._motion is not None:
              params['_motion'] = self.model._motion[mask]
+        if hasattr(self.model, '_r') and self.model._r is not None:
+             params['_r'] = self.model._r[mask]
 
         return params
     
@@ -398,6 +402,7 @@ class GaussianDensifier:
             '_t': 't',
             '_t_scale': 't_scale',
             '_motion': 'velocity',
+            '_r': 'r',
         }
 
         # Prepare dictionary for optimizer (group_name -> tensor)
@@ -456,6 +461,7 @@ class GaussianDensifier:
             't': '_t',
             't_scale': '_t_scale',
             'velocity': '_motion',
+            'r': '_r',
         }
         
         # Map back from group name to model attribute name
@@ -774,5 +780,7 @@ class FreeTimeDensificationScheduler(DensificationScheduler):
                 self.model._motion.data[donor_indices] = (
                     self.model._motion.data[receptor_indices] + vel_noise
                 )
+            if hasattr(self.model, '_r') and self.model._r is not None:
+                self.model._r.data[donor_indices] = self.model._r.data[receptor_indices]
         self.optimizer.reset_optimizer_state(final_mask)
 
