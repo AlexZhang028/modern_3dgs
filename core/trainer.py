@@ -4,15 +4,13 @@ Gaussian Splatting Trainer
 Unified training framework supporting both Static and FreeTime modes.
 """
 
-import os
 import time
 import math
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, List
 from tqdm import tqdm
-from torch.utils.data import DataLoader
 
 from config.config import TrainerConfig, DataConfig
 from utils.image_utils import psnr
@@ -22,7 +20,6 @@ from core.densify import (
     DensificationScheduler, FreeTimeDensificationScheduler,
 )
 from data.samplers import DataSampler, StaticSampler, TemporalSampler
-from utils.general_utils import inverse_sigmoid
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -182,63 +179,17 @@ class Trainer:
             optimizer      = self.optimizer,
             config         = self.config,
             scene_extent   = self.scene_extent,
-            static_mask_fn = self._get_static_mask,
+            static_mask_fn = None,
         )
 
     def _apply_gradient_routing(self, iteration: int) -> None:
-        """Phase-based gradient zeroing (Phase 2 / 3 of decoupled training).
-        Operates directly on grad tensors after backward(), so it stays in Trainer.
-        """
-        if not getattr(self.config, 'decouple_training_enabled', False):
-            return
-        if not (hasattr(self.model, '_t_scale') and self.model._t_scale is not None):
-            return
-
-        joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
-        dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-        if iteration <= joint_end:
-            return
-
-        with torch.no_grad():
-            is_static   = self._get_static_mask()
-            freeze_mask = is_static if iteration <= dynamic_end else ~is_static
-            if not freeze_mask.any():
-                return
-
-            for key in ['xyz', 'features_dc', 'features_rest', 'opacity', 'scaling', 'rotation']:
-                p = self.model._gaussian_params.get(key)
-                if p is not None and p.grad is not None:
-                    p.grad[freeze_mask] = 0.0
-
-            if iteration > dynamic_end:
-                for key in ['t', 't_scale', 'motion']:
-                    p = self.model._gaussian_params.get(key)
-                    if p is not None and p.grad is not None:
-                        p.grad[freeze_mask] = 0.0
+        """Hook: phase-based gradient zeroing. Override in FreeTimeTrainer."""
+        pass
 
     def _create_sampler(self) -> DataSampler:
-        """Create data sampler."""
         num_workers = self.data_config.num_workers if self.data_config else 0
-        if self.mode == "static":
-            return StaticSampler(self.dataset, num_workers=num_workers)
-        elif self.mode == "freetime":
-            return TemporalSampler(self.dataset, num_workers=num_workers)
-        else:
-            raise ValueError(f"Unknown training mode: {self.mode}")
+        return StaticSampler(self.dataset, num_workers=num_workers)
     
-    def _get_static_mask(self) -> torch.Tensor:
-        """Boolean mask [N]: True = static/persistent, False = dynamic/transient."""
-        dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
-        return self.model.get_t_scale.squeeze() > dur_thresh
-
-    def _get_dynamic_score(self) -> torch.Tensor:
-        """Per-Gaussian dynamism score [N,1] in [0,1]: 0=static, 1=dynamic."""
-        duration    = self.model.get_t_scale.detach()    # [N,1]
-        static_dur  = getattr(self.config, 'dynamic_duration_static',  0.5)
-        dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
-        denom = max(static_dur - dynamic_dur, 1e-6)
-        return torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
-
     # ----------------------------------------------------------------
 
     def train(self):
@@ -385,100 +336,10 @@ class Trainer:
                 scale, bias = self.color_correction[uid_key]
                 pred_img = pred_img * scale[:, None, None] + bias[:, None, None]
 
-        # Dynamic region focus weighting schedule (FreeTimeGS only)
-        use_dynamic_weighting = (
-            getattr(self.config, 'dynamic_weighting_enabled', False)
-            and hasattr(self.model, '_t_scale') and self.model._t_scale is not None
+        pixel_loss_multiplier, dw_timing_ms, dw_metrics = self._compute_dynamic_weighting(
+            iteration, camera, timestamp
         )
-        if use_dynamic_weighting:
-            boost_start_iter = getattr(self.config, 'dynamic_boost_start_iter', 15000)
-            boost_end_iter = getattr(self.config, 'dynamic_boost_end_iter', 20000)
-            max_dynamic_boost = getattr(self.config, 'max_dynamic_boost', 5.0)
-            curve_power = max(getattr(self.config, 'dynamic_boost_curve_power', 3.0), 1e-6)
-
-            if iteration < boost_start_iter:
-                current_boost = 0.0
-            elif iteration < boost_end_iter and boost_end_iter > boost_start_iter:
-                progress = (iteration - boost_start_iter) / float(boost_end_iter - boost_start_iter)
-                exp_scale = math.exp(curve_power)
-                eased_progress = (math.exp(curve_power * progress) - 1.0) / (exp_scale - 1.0)
-                current_boost = max_dynamic_boost * eased_progress
-            else:
-                current_boost = max_dynamic_boost
-        else:
-            current_boost = 0.0
-
-        dynamic_map_mean = 0.0
-        dynamic_map_max = 0.0
-        dynamic_multiplier_mean = 1.0
-        dynamic_multiplier_max = 1.0
-        pixel_loss_multiplier: torch.Tensor | float = 1.0
-        if current_boost > 0:
-            t_weight = time.perf_counter()
-            # Per-view caching: avoid re-rendering dynamic weight every step.
-            # Cache is updated every `dynamic_weight_cache_update_interval` iterations (default 10000).
-            cache_interval = getattr(self.config, 'dynamic_weight_cache_update_interval', 10000)
-            view_id = getattr(camera, 'image_name', None)
-            # Fallback to index-based key if image_name missing
-            if view_id is None:
-                view_id = f"view_{getattr(camera, 'index', '0')}"
-
-            need_update = True
-            cached_entry = self.dynamic_weight_cache.get(view_id, None)
-            if cached_entry is not None:
-                last_iter = cached_entry.get('iter', -1)
-                if (iteration - last_iter) < cache_interval:
-                    need_update = False
-
-            cache_hit = 0.0
-            if need_update:
-                with torch.no_grad():
-                    dynamic_score   = self._get_dynamic_score()   # [N,1], 0=static 1=dynamic
-                    override_colors = dynamic_score.repeat(1, 3)  # [N,3]
-
-                with torch.no_grad():
-                    weight_render_out = self.renderer(
-                        gaussians=self.model,
-                        camera=camera,
-                        bg_color=torch.zeros(3, device="cuda"),
-                        timestamp=timestamp,
-                        enable_culling=False,
-                        colors_override=override_colors,
-                    )
-
-                    dynamic_weight_map = weight_render_out['render'][0:1, :, :]
-                    # Store a CPU copy to avoid holding extra GPU memory between updates
-                    dyn_cpu = dynamic_weight_map.detach().cpu()
-                    self.dynamic_weight_cache[view_id] = {'map': dyn_cpu, 'iter': iteration}
-
-                    pixel_loss_multiplier = 1.0 + current_boost * dyn_cpu.cuda()
-                    dynamic_map_mean = dyn_cpu.mean().item()
-                    dynamic_map_max = dyn_cpu.max().item()
-                    dynamic_multiplier_mean = pixel_loss_multiplier.mean().item()
-                    dynamic_multiplier_max = pixel_loss_multiplier.max().item()
-
-                del weight_render_out
-                del dynamic_weight_map
-                timing['dynamic_weight_render_ms'] = (time.perf_counter() - t_weight) * 1000.0
-                cache_hit = 0.0
-            else:
-                # Use cached map (move to GPU temporarily)
-                t_cache = time.perf_counter()
-                dyn_cpu = cached_entry['map']
-                pixel_loss_multiplier = 1.0 + current_boost * dyn_cpu.cuda()
-                dynamic_map_mean = float(dyn_cpu.mean())
-                dynamic_map_max = float(dyn_cpu.max())
-                dynamic_multiplier_mean = pixel_loss_multiplier.mean().item()
-                dynamic_multiplier_max = pixel_loss_multiplier.max().item()
-                timing['dynamic_weight_render_ms'] = (time.perf_counter() - t_cache) * 1000.0
-                cache_hit = 1.0
-
-            # Log cache hit metric to TensorBoard (if available)
-            if hasattr(self, 'writer') and self.writer is not None:
-                try:
-                    self.writer.add_scalar('DynamicWeight/cache_hit', float(cache_hit), iteration)
-                except Exception:
-                    pass
+        timing['dynamic_weight_render_ms'] = dw_timing_ms
 
         # Handle Alpha Mask (Mask out background if necessary)
         if hasattr(camera, 'alpha_mask') and camera.alpha_mask is not None:
@@ -604,16 +465,12 @@ class Trainer:
             'l1': loss_components['l1'].item(),
             'ssim': loss_components['ssim'].item(),
             'num_gaussians': self.model.num_points,
-            'dynamic_boost': current_boost,
-            'dynamic_map_mean': dynamic_map_mean,
-            'dynamic_map_max': dynamic_map_max,
-            'dynamic_multiplier_mean': dynamic_multiplier_mean,
-            'dynamic_multiplier_max': dynamic_multiplier_max,
         }
         if 'lpips' in loss_components:
              val = loss_components['lpips']
              metrics['lpips'] = val.item() if hasattr(val, 'item') else val
 
+        metrics.update(dw_metrics)
         metrics.update(timing)
         metrics['iteration_time'] = (time.perf_counter() - step_start) * 1000.0
 
@@ -627,6 +484,25 @@ class Trainer:
     def _compute_loss_hook(self, loss: torch.Tensor, rendered: Dict, iteration: int) -> torch.Tensor:
         """Hook for additional loss computation."""
         return loss
+
+    def _compute_dynamic_weighting(
+        self, iteration: int, camera: Any, timestamp: Any
+    ):
+        """Hook: returns (pixel_loss_multiplier, timing_ms, extra_metrics).
+        Override in FreeTimeTrainer for dynamic region focus weighting.
+        """
+        return 1.0, 0.0, {}
+
+    def _get_eval_dynamic_map(self, camera: Any, iteration: int) -> Optional[torch.Tensor]:
+        """Hook: return single-channel dynamic weight map [1,H,W] for eval, or None."""
+        return None
+
+    def _log_eval_tensorboard_extras(
+        self, camera: Any, prediction: torch.Tensor, target: torch.Tensor,
+        prefix: str, iteration: int
+    ) -> None:
+        """Hook: log FreeTime-specific TensorBoard images during eval."""
+        pass
 
     def _update_sh_degree(self, iteration: int):
         """Progressive SH degree activation."""
@@ -696,9 +572,6 @@ class Trainer:
                 self.writer.add_scalar('Stats/iteration_time', metrics['iteration_time'], iteration)
             self.writer.add_scalar('Stats/num_gaussians', metrics['num_gaussians'], iteration)
             self.writer.add_scalar('Stats/sh_degree', self.current_sh_degree, iteration)
-            if hasattr(self.model, '_t') and self.model._t is not None:
-                self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
-                self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
             timing_keys = [
                 'sample_ms',
                 'lr_sh_ms',
@@ -734,19 +607,6 @@ class Trainer:
             if 'dynamic_multiplier_max' in metrics:
                 self.writer.add_scalar('DynamicWeight/multiplier_max', metrics['dynamic_multiplier_max'], iteration)
 
-            # Phase-based decoupled training: log static/dynamic Gaussian counts
-            if getattr(self.config, 'decouple_training_enabled', False) \
-                    and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                with torch.no_grad():
-                    n_static  = int(self._get_static_mask().sum().item())
-                    n_dynamic = self.model.num_points - n_static
-                self.writer.add_scalar('Decouple/n_static',  n_static,  iteration)
-                self.writer.add_scalar('Decouple/n_dynamic', n_dynamic, iteration)
-                joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
-                dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-                phase = 1 if iteration <= joint_end else (2 if iteration <= dynamic_end else 3)
-                self.writer.add_scalar('Decouple/phase', phase, iteration)
-
         # History
         self.stats['loss_history'].append(metrics['loss'])
         self.stats['gaussian_count'].append(metrics['num_gaussians'])
@@ -768,20 +628,7 @@ class Trainer:
         self.model.train()
 
     def _render_for_eval(self, camera, bg_color: torch.Tensor, **kwargs):
-        """Render helper for evaluation with explicit mode separation."""
-        render_kwargs = {
-            'gaussians': self.model,
-            'camera': camera,
-            'bg_color': bg_color,
-            **kwargs,
-        }
-
-        # Only temporal model needs timestamp during evaluation.
-        if self.mode == "freetime":
-            ts = getattr(camera, 'timestamp', None)
-            render_kwargs['timestamp'] = 0.0 if ts is None else ts
-
-        return self.renderer(**render_kwargs)
+        return self.renderer(gaussians=self.model, camera=camera, bg_color=bg_color, **kwargs)
 
     def _evaluate_set(self, dataset, indices: List[int], prefix: str, iteration: int):
         """Evaluate a specific dataset subset."""
@@ -819,34 +666,10 @@ class Trainer:
                 psnr_list.append(psnr_val)
                 ssim_list.append(ssim_val)
 
-                dynamic_weight_map = None
-                masked_psnr_dynamic = None
-                masked_psnr_static = None
-
-                use_masked_psnr = (
-                    getattr(self.config, 'dynamic_weighting_enabled', False)
-                    and iteration >= getattr(self.config, 'dynamic_boost_start_iter', 15000)
-                    and hasattr(self.model, '_t_scale') and self.model._t_scale is not None
-                )
-
-                if use_masked_psnr:
-                    with torch.no_grad():
-                        dynamic_score   = self._get_dynamic_score()
-                        override_colors = dynamic_score.repeat(1, 3)
-
-                        weight_render_out = self._render_for_eval(
-                            camera=camera,
-                            bg_color=torch.zeros(3, device="cuda"),
-                            enable_culling=False,
-                            colors_override=override_colors,
-                        )
-
-                        dynamic_weight_map = weight_render_out['render'][0:1, :, :].detach().clamp(0.0, 1.0)
-                        del weight_render_out
-
+                dynamic_weight_map = self._get_eval_dynamic_map(camera, iteration)
+                if dynamic_weight_map is not None:
                     dynamic_mask_threshold = getattr(self.config, 'dynamic_mask_threshold', 0.5)
                     dynamic_mask = (dynamic_weight_map >= dynamic_mask_threshold).float()
-                    valid_mask = None
                     if hasattr(camera, 'alpha_mask') and camera.alpha_mask is not None:
                         valid_mask = camera.alpha_mask.cuda()[0:1]
                         dynamic_mask = dynamic_mask * valid_mask
@@ -870,37 +693,7 @@ class Trainer:
                     # Render result on every log
                     self.writer.add_image(f'{prefix}_Render/{camera.image_name}', prediction, iteration)
 
-                    # Dynamic weight heatmap (if enabled)
-                    if getattr(self.config, 'dynamic_weighting_enabled', False) and hasattr(self.model, '_t_scale') and self.model._t_scale is not None:
-                        with torch.no_grad():
-                            dynamic_score   = self._get_dynamic_score()
-                            override_colors = dynamic_score.repeat(1, 3)
-
-                            weight_render_out = self._render_for_eval(
-                                camera=camera,
-                                bg_color=torch.zeros(3, device="cuda"),
-                                enable_culling=False,
-                                colors_override=override_colors
-                            )
-
-                            # Single-channel weight map -> colorize for TensorBoard
-                            dynamic_weight_map = weight_render_out['render'][0:1, :, :].detach().clamp(0.0, 1.0)
-
-                            # Convert to RGB using matplotlib colormap
-                            try:
-                                import matplotlib.cm as cm
-                                import numpy as np
-
-                                w_np = dynamic_weight_map.squeeze(0).cpu().numpy()
-                                cmap = cm.get_cmap('plasma')
-                                rgba = cmap(w_np)[:, :, :3]
-                                rgb = torch.from_numpy(rgba).permute(2, 0, 1).to(dtype=torch.float32)
-                                self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', rgb, iteration)
-                            except Exception:
-                                # Fallback: log single-channel as grayscale
-                                self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', dynamic_weight_map, iteration)
-
-                            del weight_render_out
+                    self._log_eval_tensorboard_extras(camera, prediction, target, prefix, iteration)
 
                     # 5. Gradient Contribution Map
                     with torch.enable_grad():
@@ -1090,43 +883,36 @@ class Trainer:
 
 
 class FreeTimeTrainer(Trainer):
-    """
-    Trainer specific for FreeTimeGS (Temporal).
-    Adds 4D Regularization and Relocation logic.
-    """
-    def _compute_loss_hook(self, loss: torch.Tensor, rendered: Dict, iteration: int) -> torch.Tensor:
-        # 4D Regularization Loss
-        # Prevents "walls" of opacity in early training
-        # Formula: L_reg = 1/N * sum(sigma * sg[sigma(t)])
-        # Based on FreeTimeGS reference. 
-        # sigma: base_opacity
-        # sigma(t): temporal_weight (which is 0.0-1.0)
-        
-        base_opacity = rendered['base_opacity']
-        temporal_weight = rendered['temporal_weight']
-        
-        # Weight from config
-        reg_weight = self.config.lambda_reg
-        
-        # Only detach the temporal instance component
-        # We penalize base_opacity if the gaussian is active at this time (high temporal_weight)
-        # if iteration < 1000:
-        #     l_reg = 0
-        # else:
-        l_reg = (base_opacity * temporal_weight.detach()).mean()
-        loss += reg_weight * l_reg
+    """FreeTimeGS trainer. Extends Trainer with all temporal-specific logic."""
 
-        if iteration > getattr(self.config, 'motion_blur_start_iter', 15000) and hasattr(self.model, '_motion') and self.model._motion is not None:
-            speed = torch.norm(self.model._motion, dim=-1).detach()
-            duration = torch.exp(self.model._t_scale).squeeze(-1)
-            fast_mask = speed > getattr(self.config, 'motion_blur_speed_threshold', 0.5)
+    # ------------------------------------------------------------------ #
+    #  Sampler                                                             #
+    # ------------------------------------------------------------------ #
 
-            if fast_mask.any():
-                lambda_motion_blur = getattr(self.config, 'lambda_motion_blur', 0.05)
-                motion_blur_loss = (speed[fast_mask] * duration[fast_mask]).mean()
-                loss += lambda_motion_blur * motion_blur_loss
-            
-        return loss
+    def _create_sampler(self):
+        num_workers = self.data_config.num_workers if self.data_config else 0
+        return TemporalSampler(self.dataset, num_workers=num_workers)
+
+    # ------------------------------------------------------------------ #
+    #  Static / dynamic classification                                     #
+    # ------------------------------------------------------------------ #
+
+    def _get_static_mask(self) -> torch.Tensor:
+        """Boolean mask [N]: True = static/persistent, False = dynamic/transient."""
+        dur_thresh = getattr(self.config, 'decouple_static_duration_threshold', 0.5)
+        return self.model.get_t_scale.squeeze() > dur_thresh
+
+    def _get_dynamic_score(self) -> torch.Tensor:
+        """Per-Gaussian dynamism score [N,1] in [0,1]: 0=static, 1=dynamic."""
+        duration    = self.model.get_t_scale.detach()
+        static_dur  = getattr(self.config, 'dynamic_duration_static',  0.5)
+        dynamic_dur = getattr(self.config, 'dynamic_duration_dynamic', 0.1)
+        denom = max(static_dur - dynamic_dur, 1e-6)
+        return torch.clamp((static_dur - duration) / denom, 0.0, 1.0)
+
+    # ------------------------------------------------------------------ #
+    #  Densifier                                                           #
+    # ------------------------------------------------------------------ #
 
     def _create_densifier(self) -> FreeTimeDensificationScheduler:
         densify_config = DensificationConfig(
@@ -1147,15 +933,198 @@ class FreeTimeTrainer(Trainer):
             static_mask_fn = self._get_static_mask,
         )
 
+    # ------------------------------------------------------------------ #
+    #  Gradient routing (phase-based decoupled training)                  #
+    # ------------------------------------------------------------------ #
+
+    def _apply_gradient_routing(self, iteration: int) -> None:
+        if not getattr(self.config, 'decouple_training_enabled', False):
+            return
+
+        joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+        dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+        if iteration <= joint_end:
+            return
+
+        with torch.no_grad():
+            is_static   = self._get_static_mask()
+            freeze_mask = is_static if iteration <= dynamic_end else ~is_static
+            if not freeze_mask.any():
+                return
+
+            for key in ['xyz', 'features_dc', 'features_rest', 'opacity', 'scaling', 'rotation']:
+                p = self.model._gaussian_params.get(key)
+                if p is not None and p.grad is not None:
+                    p.grad[freeze_mask] = 0.0
+
+            if iteration > dynamic_end:
+                for key in ['t', 't_scale', 'motion']:
+                    p = self.model._gaussian_params.get(key)
+                    if p is not None and p.grad is not None:
+                        p.grad[freeze_mask] = 0.0
+
+    # ------------------------------------------------------------------ #
+    #  Dynamic region focus weighting                                      #
+    # ------------------------------------------------------------------ #
+
+    def _compute_dynamic_weighting(self, iteration: int, camera: Any, timestamp: Any):
+        use_dynamic_weighting = getattr(self.config, 'dynamic_weighting_enabled', False)
+        if not use_dynamic_weighting:
+            return 1.0, 0.0, {}
+
+        boost_start_iter = getattr(self.config, 'dynamic_boost_start_iter', 15000)
+        boost_end_iter   = getattr(self.config, 'dynamic_boost_end_iter',   20000)
+        max_dynamic_boost = getattr(self.config, 'max_dynamic_boost', 5.0)
+        curve_power = max(getattr(self.config, 'dynamic_boost_curve_power', 3.0), 1e-6)
+
+        if iteration < boost_start_iter:
+            current_boost = 0.0
+        elif iteration < boost_end_iter and boost_end_iter > boost_start_iter:
+            progress = (iteration - boost_start_iter) / float(boost_end_iter - boost_start_iter)
+            eased_progress = (math.exp(curve_power * progress) - 1.0) / (math.exp(curve_power) - 1.0)
+            current_boost = max_dynamic_boost * eased_progress
+        else:
+            current_boost = max_dynamic_boost
+
+        if current_boost <= 0.0:
+            return 1.0, 0.0, {'dynamic_boost': 0.0, 'dynamic_map_mean': 0.0,
+                               'dynamic_map_max': 0.0, 'dynamic_multiplier_mean': 1.0,
+                               'dynamic_multiplier_max': 1.0}
+
+        cache_interval = getattr(self.config, 'dynamic_weight_cache_update_interval', 10000)
+        view_id = getattr(camera, 'image_name', None) or f"view_{getattr(camera, 'index', '0')}"
+
+        cached_entry = self.dynamic_weight_cache.get(view_id)
+        need_update = cached_entry is None or (iteration - cached_entry.get('iter', -1)) >= cache_interval
+
+        t_weight = time.perf_counter()
+        if need_update:
+            with torch.no_grad():
+                override_colors = self._get_dynamic_score().repeat(1, 3)
+                weight_out = self.renderer(
+                    gaussians=self.model, camera=camera,
+                    bg_color=torch.zeros(3, device="cuda"),
+                    timestamp=timestamp, enable_culling=False,
+                    colors_override=override_colors,
+                )
+                dyn_cpu = weight_out['render'][0:1].detach().cpu()
+                self.dynamic_weight_cache[view_id] = {'map': dyn_cpu, 'iter': iteration}
+                del weight_out
+        else:
+            dyn_cpu = cached_entry['map']
+
+        cache_hit = 0.0 if need_update else 1.0
+        if self.writer is not None:
+            try:
+                self.writer.add_scalar('DynamicWeight/cache_hit', cache_hit, iteration)
+            except Exception:
+                pass
+
+        multiplier = 1.0 + current_boost * dyn_cpu.cuda()
+        timing_ms = (time.perf_counter() - t_weight) * 1000.0
+        extra = {
+            'dynamic_boost':            current_boost,
+            'dynamic_map_mean':         float(dyn_cpu.mean()),
+            'dynamic_map_max':          float(dyn_cpu.max()),
+            'dynamic_multiplier_mean':  multiplier.mean().item(),
+            'dynamic_multiplier_max':   multiplier.max().item(),
+        }
+        return multiplier, timing_ms, extra
+
+    # ------------------------------------------------------------------ #
+    #  Loss hook                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _compute_loss_hook(self, loss: torch.Tensor, rendered: Dict, iteration: int) -> torch.Tensor:
+        reg_weight = self.config.lambda_reg
+        l_reg = (rendered['base_opacity'] * rendered['temporal_weight'].detach()).mean()
+        loss += reg_weight * l_reg
+
+        if iteration > getattr(self.config, 'motion_blur_start_iter', 15000) \
+                and hasattr(self.model, '_motion') and self.model._motion is not None:
+            speed = torch.norm(self.model._motion, dim=-1).detach()
+            duration = torch.exp(self.model._t_scale).squeeze(-1)
+            fast_mask = speed > getattr(self.config, 'motion_blur_speed_threshold', 0.5)
+            if fast_mask.any():
+                loss += getattr(self.config, 'lambda_motion_blur', 0.05) * \
+                        (speed[fast_mask] * duration[fast_mask]).mean()
+        return loss
+
+    # ------------------------------------------------------------------ #
+    #  Evaluation helpers                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _render_for_eval(self, camera, bg_color: torch.Tensor, **kwargs):
+        ts = getattr(camera, 'timestamp', None)
+        kwargs.setdefault('timestamp', 0.0 if ts is None else ts)
+        return super()._render_for_eval(camera, bg_color, **kwargs)
+
+    def _get_eval_dynamic_map(self, camera: Any, iteration: int) -> Optional[torch.Tensor]:
+        if not (
+            getattr(self.config, 'dynamic_weighting_enabled', False)
+            and iteration >= getattr(self.config, 'dynamic_boost_start_iter', 15000)
+        ):
+            return None
+        with torch.no_grad():
+            override_colors = self._get_dynamic_score().repeat(1, 3)
+            out = self._render_for_eval(
+                camera=camera, bg_color=torch.zeros(3, device="cuda"),
+                enable_culling=False, colors_override=override_colors,
+            )
+            result = out['render'][0:1].detach().clamp(0.0, 1.0)
+            del out
+        return result
+
+    def _log_eval_tensorboard_extras(
+        self, camera: Any, prediction: torch.Tensor, target: torch.Tensor,
+        prefix: str, iteration: int
+    ) -> None:
+        if not (self.writer and getattr(self.config, 'dynamic_weighting_enabled', False)):
+            return
+        with torch.no_grad():
+            override_colors = self._get_dynamic_score().repeat(1, 3)
+            out = self._render_for_eval(
+                camera=camera, bg_color=torch.zeros(3, device="cuda"),
+                enable_culling=False, colors_override=override_colors,
+            )
+            dmap = out['render'][0:1].detach().clamp(0.0, 1.0)
+            del out
+        try:
+            import matplotlib.cm as cm
+            import numpy as np
+            rgba = cm.get_cmap('plasma')(dmap.squeeze(0).cpu().numpy())[:, :, :3]
+            rgb = torch.from_numpy(rgba).permute(2, 0, 1).to(dtype=torch.float32)
+            self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', rgb, iteration)
+        except Exception:
+            self.writer.add_image(f'{prefix}_DynamicWeight/{camera.image_name}', dmap, iteration)
+
+    # ------------------------------------------------------------------ #
+    #  Metrics logging                                                     #
+    # ------------------------------------------------------------------ #
+
     def _log_metrics(self, iteration: int, metrics: Dict[str, float]):
         super()._log_metrics(iteration, metrics)
-        if self.writer:
-            self.writer.add_histogram('params/t_scale_log', self.model._t_scale, iteration)
-            if hasattr(self.model, '_motion') and self.model._motion is not None:
-                # Calculate speed (norm of velocity) to track distribution and help tune the 2.0 denominator
-                speed = torch.norm(self.model._motion, dim=-1)
-                self.writer.add_histogram('params/velocity_norm', speed, iteration)
-                self.writer.add_scalar('stats/speed_max', speed.max().item(), iteration)
-                self.writer.add_scalar('stats/speed_mean', speed.mean().item(), iteration)
+        if not self.writer:
+            return
+        # Temporal parameter distributions
+        self.writer.add_scalar('stats/gaussian_t_min', self.model.get_t.min().item(), iteration)
+        self.writer.add_scalar('stats/gaussian_t_max', self.model.get_t.max().item(), iteration)
+        self.writer.add_histogram('params/t_scale_log', self.model._t_scale, iteration)
+        if hasattr(self.model, '_motion') and self.model._motion is not None:
+            speed = torch.norm(self.model._motion, dim=-1)
+            self.writer.add_histogram('params/velocity_norm', speed, iteration)
+            self.writer.add_scalar('stats/speed_max',  speed.max().item(),  iteration)
+            self.writer.add_scalar('stats/speed_mean', speed.mean().item(), iteration)
+        # Phase-based decoupled training stats
+        if getattr(self.config, 'decouple_training_enabled', False):
+            with torch.no_grad():
+                n_static  = int(self._get_static_mask().sum().item())
+                n_dynamic = self.model.num_points - n_static
+            self.writer.add_scalar('Decouple/n_static',  n_static,  iteration)
+            self.writer.add_scalar('Decouple/n_dynamic', n_dynamic, iteration)
+            joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
+            dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+            phase = 1 if iteration <= joint_end else (2 if iteration <= dynamic_end else 3)
+            self.writer.add_scalar('Decouple/phase', phase, iteration)
 
 
