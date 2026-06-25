@@ -1,15 +1,12 @@
 data:
   cache_images: false
-  data_device: cuda
   end_frame: -1
   eval: false
   images: images
   init_point_cloud_path: ''
-  lazy_loading: true
   model_path: ..\FreeTimeGS_res\bar\04
   normalized_t: false
   num_workers: 0
-  pin_memory: true
   resolution: 4
   source_path: ..\3DGS_test_data\bar-release
   start_frame: 3420

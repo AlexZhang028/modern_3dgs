@@ -24,6 +24,53 @@ Usage:
 
 import sys
 import os
+
+# ─── Linux GTK hard-crash prevention ─────────────────────────────────────────
+# Problem: GLFW pulls in GTK 3 (for clipboard/Wayland support).  On RHEL-family
+# systems the adwaita-icon-theme package ships *empty* SVG files.  GTK resolves
+# any missing icon to the "image-missing" fallback, which is also an empty SVG,
+# and then hits a fatal g_assert → SIGABRT before the viewer window opens.
+#
+# Root cause: os.environ changes are too late — GTK reads env vars when its .so
+# is dlopen()'d (i.e. at `import glfw`), not when Python code runs.
+#
+# Two-stage fix (runs only once, before any other import):
+#   Stage 1 — write a valid local SVG override at $XDG_DATA_HOME/icons/…  so
+#              GTK finds it before the broken system file (XDG search order).
+#   Stage 2 — os.execve() to *replace* the current process with a fresh one
+#              that already has the GTK env vars set when its first .so loads.
+#              The sentinel _VIEWER_ENV_SET prevents infinite re-exec.
+if sys.platform.startswith('linux') and not os.environ.get('_VIEWER_ENV_SET'):
+    from pathlib import Path as _P
+
+    # Stage 1: local SVG override
+    _svg = _P.home() / '.local/share/icons/Adwaita/scalable/status/image-missing.svg'
+    if not _svg.exists() or _svg.stat().st_size == 0:
+        _svg.parent.mkdir(parents=True, exist_ok=True)
+        _svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"/>\n')
+    _idx = _P.home() / '.local/share/icons/Adwaita/index.theme'
+    if not _idx.exists():
+        _idx.write_text(
+            '[Icon Theme]\nName=Adwaita\nDirectories=scalable/status\n\n'
+            '[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=256\n'
+        )
+
+    # Stage 2: re-exec with env vars baked in from process start
+    _env = os.environ.copy()
+    _env.update({
+        'GTK_THEME':        'Hicolor',
+        'NO_AT_BRIDGE':     '1',
+        'GDK_BACKEND':      'x11',
+        '_VIEWER_ENV_SET':  '1',
+    })
+    _cache = '/usr/lib64/gdk-pixbuf-2.0/2.10.0/loaders.cache'
+    if not _env.get('GDK_PIXBUF_MODULE_FILE') and os.path.isfile(_cache):
+        _env['GDK_PIXBUF_MODULE_FILE'] = _cache
+    os.execve(sys.executable, [sys.executable] + sys.argv, _env)
+    # os.execve replaces the process image — code below only runs in the
+    # re-exec'd process where _VIEWER_ENV_SET=1 and the env is already clean.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import argparse
 import time
 import math
@@ -36,15 +83,10 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# On Linux, GTK may fail to find the gdk-pixbuf loaders cache, causing a hard
-# crash when GLFW triggers GTK icon loading. Point it to the known location if
-# the env var is not already set.
-if sys.platform.startswith('linux') and not os.environ.get('GDK_PIXBUF_MODULE_FILE'):
-    _candidate = '/usr/lib64/gdk-pixbuf-2.0/2.10.0/loaders.cache'
-    if os.path.isfile(_candidate):
-        os.environ['GDK_PIXBUF_MODULE_FILE'] = _candidate
-
-from core.gaussian_model import GaussianModel, FreeTimeGaussianModel, detect_mode_from_ply
+from core.gaussian_model import (
+    GaussianModel, FreeTimeGaussianModel, SharpTimeGaussianModel,
+    detect_mode_from_ply, create_model_from_config,
+)
 from core.renderer import GaussianRenderer
 from config.config import ModelConfig, PipelineConfig
 from data.camera import Camera
@@ -493,8 +535,8 @@ def run_live_viewer(args, gaussians, renderer, init_center, init_radius):
     glfw.set_cursor_pos_callback(window, cursor_pos_callback)
     glfw.set_scroll_callback(window, scroll_callback)
     
-    # Time Configuration
-    is_freetime = gaussians.mode == "freetime"
+    # Time Configuration — both freetime and sharptime are dynamic
+    is_freetime = gaussians.mode in ("freetime", "sharptime")
     
     start_time = args.start_time
     end_time = args.end_time
@@ -657,17 +699,26 @@ def main():
     seed_everything(0)
     
     # 1. Detect Mode & Load Model
-    mode = detect_mode_from_ply(args.ply)
-    print(f"Detected Model Mode: {mode.upper()}")
-    
-    config = ModelConfig(mode=mode, sh_degree=3) # Assume SH=3
-    if mode == "freetime":
-        gaussians = FreeTimeGaussianModel(config, args.device)
+    from plyfile import PlyData as _PlyData
+    _ply_fields = {p.name for p in _PlyData.read(args.ply)['vertex'].properties}
+    _is_init_pcd = 'opacity' not in _ply_fields   # init PLY has no trained Gaussian attrs
+
+    if _is_init_pcd:
+        # Init point cloud (output of sharptime_init.py) — use create_from_pcd path
+        mode = "sharptime" if ('t' in _ply_fields or 'motion_0' in _ply_fields) else "static"
+        print(f"Detected init point cloud (no opacity field). Visualising as {mode.upper()} gaussians...")
+        config = ModelConfig(mode=mode, sh_degree=3)
+        gaussians = create_model_from_config(config, args.device)
+        from data.ply_utils import fetchPly
+        pcd = fetchPly(args.ply)
+        gaussians.create_from_pcd(pcd, spatial_lr_scale=1.0)
     else:
-        gaussians = GaussianModel(config, args.device)
-        
-    print(f"Loading PLY from {args.ply}...")
-    gaussians.load_ply(args.ply)
+        mode = detect_mode_from_ply(args.ply)
+        print(f"Detected Model Mode: {mode.upper()}")
+        config = ModelConfig(mode=mode, sh_degree=3)
+        gaussians = create_model_from_config(config, args.device)
+        print(f"Loading PLY from {args.ply}...")
+        gaussians.load_ply(args.ply)
     
     # 2. Setup Renderer
     render_config = PipelineConfig()
@@ -706,9 +757,8 @@ def main():
                     test_cameras=[cam_name],
                     start_frame=args.start_frame,
                     end_frame=args.end_frame,
-                    use_tmp=False,
                     cache_images=False,
-                    lazy_loading=True,
+                    # lazy_loading=True,
                     inference_only=True,
                 )
                 ds = setup_dataset(dc, split="test")
@@ -738,7 +788,7 @@ def main():
             interp_out = cv2.VideoWriter(out_path, fourcc, args.fps, (render_w, render_h))
             bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-            if mode == "freetime":
+            if mode in ("freetime", "sharptime"):
                 print(f"Rendering {args.interp_frames} interpolated frames "
                       f"({render_w}x{render_h}), cam {cam_name_a}→{cam_name_b}, "
                       f"t {t_start:.4f}→{t_end:.4f}...")
@@ -751,7 +801,7 @@ def main():
                 interp_cam = SimpleCamera(render_w, render_h, fov_x_deg, device=args.device)
                 interp_cam.update_pose(c2w)
                 with torch.no_grad():
-                    if mode == "freetime":
+                    if mode in ("freetime", "sharptime"):
                         render_t = (1.0 - alpha) * t_start + alpha * t_end
                         out_dict = renderer(gaussians, interp_cam, bg_color,
                                             timestamp=render_t, enable_culling=True)
@@ -782,9 +832,8 @@ def main():
                 test_cameras=[cam_name],
                 start_frame=args.start_frame,
                 end_frame=args.end_frame,
-                use_tmp=args.output_gt,
                 cache_images=False,
-                lazy_loading=True,
+                # lazy_loading=True,
                 inference_only=not args.output_gt
             )
             dataset = setup_dataset(data_config, split="test")
@@ -819,7 +868,7 @@ def main():
                 cam_data = sample['camera'].to(args.device)
                 
                 with torch.no_grad():
-                    if mode == "freetime":
+                    if mode in ("freetime", "sharptime"):
                         out_dict = renderer(gaussians, cam_data, bg_color, timestamp=cam_data.timestamp, enable_culling=True)
                     else:
                         out_dict = renderer(gaussians, cam_data, bg_color)
@@ -857,7 +906,7 @@ def main():
             cv2.imwrite(out_path, cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
             print(f"Saved to {out_path}")
             
-        elif mode == "freetime":
+        elif mode in ("freetime", "sharptime"):
             print("Rendering Temporal Video...")
             frames = []
             

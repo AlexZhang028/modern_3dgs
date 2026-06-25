@@ -568,14 +568,25 @@ class DensificationScheduler:
         if iteration > densify_from and iteration % densify_interval == 0:
             size_threshold = 20 if iteration > opacity_reset_interval else None
             t0 = time.perf_counter()
-            self.densifier.densify_and_prune(
-                iteration       = iteration,
-                max_grad        = self._compute_grad_threshold(iteration),
-                min_opacity     = getattr(self.config, 'prune_opacity_threshold', 0.005),
-                extent          = self.scene_extent,
-                max_screen_size = size_threshold,
-                n_split_override= self._compute_n_split(iteration),
-            )
+            max_gs    = getattr(self.config, 'max_num_gaussians', -1)
+            over_cap  = (max_gs > 0 and self.model.num_points >= max_gs)
+            if over_cap:
+                # Hard cap reached: prune only, skip clone/split to prevent OOM
+                self.densifier.prune_low_opacity(
+                    getattr(self.config, 'prune_opacity_threshold', 0.005)
+                )
+                if size_threshold is not None:
+                    self.densifier.prune_big_points(size_threshold, self.scene_extent)
+                self.densifier.reset_stats()
+            else:
+                self.densifier.densify_and_prune(
+                    iteration       = iteration,
+                    max_grad        = self._compute_grad_threshold(iteration),
+                    min_opacity     = getattr(self.config, 'prune_opacity_threshold', 0.005),
+                    extent          = self.scene_extent,
+                    max_screen_size = size_threshold,
+                    n_split_override= self._compute_n_split(iteration),
+                )
             timing['densify_prune_ms'] = (time.perf_counter() - t0) * 1000.0
 
         white_bg_first = (
@@ -689,28 +700,35 @@ class FreeTimeDensificationScheduler(DensificationScheduler):
     def step(self, iteration: int) -> Dict[str, float]:
         timing: Dict[str, float] = {}
 
+        densify_from     = getattr(self.config, 'densify_from_iter', 500)
+        densify_until    = getattr(self.config, 'densify_until_iter', 15000)
+        reloc_interval   = getattr(self.config, 'relocation_interval', 500)
+        densify_interval = getattr(self.config, 'densify_interval', 100)
+
         # Relocation runs before densify so recycled Gaussians participate immediately
-        densify_from   = getattr(self.config, 'densify_from_iter', 500)
-        densify_until  = getattr(self.config, 'densify_until_iter', 15000)
-        reloc_interval = getattr(self.config, 'relocation_interval', 500)
         if (iteration > densify_from and iteration <= densify_until
                 and iteration % reloc_interval == 0):
             t0 = time.perf_counter()
             self._relocate_gaussians(iteration)
             timing['relocate_ms'] = (time.perf_counter() - t0) * 1000.0
 
+        # Per-class grad scaling: boost dynamic Gaussian grad accum right before
+        # the densification decision so their effective threshold is lower than
+        # static Gaussians' (whose accumulated stats are already zeroed by phase
+        # stat-masking).  This runs only at densification ticks to avoid
+        # accumulating compound scaling across non-densify iterations.
+        if (iteration > densify_from and iteration <= densify_until
+                and iteration % densify_interval == 0):
+            self._scale_dynamic_grads(iteration)
+
         timing.update(super().step(iteration))
         return timing
 
     def _compute_grad_threshold(self, iteration: int) -> float:
-        threshold = super()._compute_grad_threshold(iteration)
-        if getattr(self.config, 'decouple_training_enabled', False):
-            joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
-            dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-            if joint_end < iteration <= dynamic_end:
-                mult      = getattr(self.config, 'decouple_dynamic_densify_mult', 0.5)
-                threshold *= mult
-        return threshold
+        # Use the base scheduler's threshold unchanged. Dynamic Gaussians are
+        # boosted via _scale_dynamic_grads rather than by lowering a global
+        # threshold, which would affect all Gaussians uniformly.
+        return super()._compute_grad_threshold(iteration)
 
     def _compute_n_split(self, iteration: int) -> Optional[int]:
         if getattr(self.config, 'decouple_training_enabled', False):
@@ -719,6 +737,36 @@ class FreeTimeDensificationScheduler(DensificationScheduler):
             if joint_end < iteration <= dynamic_end:
                 return getattr(self.config, 'decouple_dynamic_n_split', 3)
         return None
+
+    def _scale_dynamic_grads(self, iteration: int) -> None:
+        """Boost gradient accumulation for dynamic Gaussians before densification.
+
+        Divides the accumulated gradient norm of dynamic Gaussians by
+        `decouple_dynamic_densify_mult` (< 1), making them appear to have
+        higher gradients than the base threshold requires.  Static Gaussians'
+        stats are already zeroed by _apply_phase_stat_masking, so they are
+        unaffected regardless of classification accuracy.
+        """
+        if not getattr(self.config, 'decouple_training_enabled', False):
+            return
+        joint_end   = getattr(self.config, 'decouple_joint_end_iter', 15000)
+        dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
+        if not (joint_end < iteration <= dynamic_end):
+            return
+        if self.static_mask_fn is None:
+            return
+
+        mult = getattr(self.config, 'decouple_dynamic_densify_mult', 0.5)
+        if mult <= 0.0 or mult >= 1.0:
+            return
+
+        is_dynamic = ~self.static_mask_fn()
+        n = min(self.densifier.xyz_gradient_accum.shape[0], is_dynamic.shape[0])
+        dyn = is_dynamic[:n]
+        if not dyn.any():
+            return
+        # Boost: grad_accum / mult  →  effective threshold multiplied by mult
+        self.densifier.xyz_gradient_accum[:n][dyn] /= mult
 
     def _relocate_gaussians(self, iteration: int) -> None:
         """MCMC-style relocation (FreeTimeGS++, Secret 4)."""

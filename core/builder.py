@@ -32,12 +32,6 @@ def setup_dataset(data_config: DataConfig, split: str = "train") -> Optional[Gau
         if split == "train":
             print("   Multiprocessing enabled: Forcing dataset cache to CPU")
             
-    # If using tmp storage/high-res, force CPU cache to avoid VRAM OOM
-    if data_config.use_tmp and dataset_cache_device == "cuda":
-        if split == "train":
-            print("   'use_tmp' enabled: Forcing dataset cache to CPU to save VRAM")
-        dataset_cache_device = "cpu"
-
     # Detect dataset type
     is_selfcap = (os.path.exists(os.path.join(data_config.source_path, "extri.yml")) or 
                   os.path.exists(os.path.join(data_config.source_path, "optimized", "extri.yml")))
@@ -61,7 +55,6 @@ def setup_dataset(data_config: DataConfig, split: str = "train") -> Optional[Gau
             test_camera_names=data_config.test_cameras,
             train_camera_names=data_config.train_cameras,
             normalized_t=data_config.normalized_t,
-            use_tmp=data_config.use_tmp,
             inference_only=getattr(data_config, 'inference_only', False),
         )
         
@@ -177,7 +170,7 @@ def setup_model(
                 cameras_extent = camera_centers.std().item() * 3
                 print(f"   Fallback to std*3 extent: {cameras_extent:.6f}")
         
-        if model.mode == "freetime":
+        if model.mode in ("freetime", "sharptime"):
             model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent, time_info=time_info)
         else:
             model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent)
@@ -214,7 +207,7 @@ def setup_model(
             normals=normals
         )
         
-        if model.mode == "freetime":
+        if model.mode in ("freetime", "sharptime"):
             model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent, time_info=time_info)
         else:
             model.create_from_pcd(pcd, spatial_lr_scale=cameras_extent)

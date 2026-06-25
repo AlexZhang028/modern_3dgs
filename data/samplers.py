@@ -43,7 +43,7 @@ class StaticSampler(DataSampler):
                 batch_size=1,
                 shuffle=True,
                 num_workers=num_workers,
-                pin_memory=True,
+                pin_memory=False,
                 collate_fn=identity_collate_fn, # Return single item directly
                 persistent_workers=True
             )
@@ -88,7 +88,7 @@ class TemporalSampler(DataSampler):
                 batch_size=1,
                 shuffle=True, # Random sampling
                 num_workers=num_workers,
-                pin_memory=True,
+                pin_memory=False,
                 collate_fn=identity_collate_fn,
                 persistent_workers=True
             )

@@ -1,0 +1,92 @@
+data:
+  cache_images: false
+  end_frame: 3010
+  eval: false
+  images: images
+  init_point_cloud_path: '/media/data/freetimegs/data/corgi-release/sharptime_init.ply'
+  model_path: /media/data/freetimegs/res/corgi/baseline_vanilla
+  normalized_t: false
+  num_workers: 0
+  resolution: 4
+  source_path: /media/data/freetimegs/data/corgi-release/
+  start_frame: 2950
+  test_cameras:
+  - ''
+  train_cameras: null
+  white_background: false
+
+# ---------------------------------------------------------------------------
+# Vanilla SharpTimeGS baseline — follows the original paper (2602.02989v2)
+# exactly, without any FreeTimeGS++ additions.
+#
+# Paper loss (Eq.7): L_reg = λ_scale·L_scale + λ_opacity·L_opacity
+#                           + λ_n·L_n + λ_t·L_t
+# NOT in paper: motion blur penalty, phase decoupling, SAM2 boost, color correction.
+#
+# Purpose: clean reference point matching original SharpTimeGS behavior.
+# ---------------------------------------------------------------------------
+
+iterations: 50000
+
+densify:
+  densify_from_iter: 500
+  densify_until_iter: 25000
+  densify_interval: 100
+  densify_grad_threshold: 0.0001
+  densify_grad_threshold_final: 0.0001
+  opacity_reset_until_iter: 12000
+  prune_opacity_threshold: 0.005
+  prune_from_iter: 500
+  percent_dense: 0.01
+  N_split: 2
+  # Velocity-conditioned scale restriction (part of SharpTimeGS motion model)
+  velocity_normalizer: 2.0
+  scale_shrink_multiplier: 2.0
+  min_dynamic_scale_denominator: 1e-6
+  clone_speed_shrink_coeff: 0.75
+  split_scale_shrink_base: 0.8
+
+model:
+  mode: sharptime
+  percent_dense: 0.01
+  sh_degree: 3
+
+optim:
+  feature_lr: 0.0025
+  iterations: 50000
+  lambda_dssim: 0.2
+  opacity_lr: 0.025
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  t_lr: 0.0001
+  t_scale_lr: 0.005
+  velocity_lr: 0.00016
+  r_lr: 0.001
+  opacity_reset_until_iter: 12000
+
+trainer:
+  lambda_reg: 0.01
+  log_interval: 10
+  relocation_interval: 100
+  save_interval: 5000
+  test_interval: 5000
+  opacity_reset_until_iter: 12000
+
+  # --- Phase decoupling: DISABLED -------------------------------------------
+  decouple_training_enabled: false
+
+  # --- SAM2 dynamic loss boost: DISABLED ------------------------------------
+  dynamic_weighting_enabled: false
+
+  # --- Color correction: DISABLED -------------------------------------------
+  color_correction_enabled: false
+
+  # --- SharpTimeGS regularization (paper Eq.7) ------------------------------
+  lambda_scale: 0.01
+  lambda_lifespan: 0.01
+  lambda_n: 0.01        # triggers a second render pass every iteration
+
+  # Motion blur penalty: NOT in original SharpTimeGS paper — disabled
+  lambda_motion_blur: 0.0

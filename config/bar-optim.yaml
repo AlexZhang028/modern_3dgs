@@ -1,15 +1,12 @@
 data:
   cache_images: false
-  data_device: cuda
   end_frame: -1
   eval: false
   images: images
   init_point_cloud_path: ''
-  lazy_loading: true
-  model_path: /media/data/freetimegs/res/bar/05_remove_gate
+  model_path: /media/data/freetimegs/res/bar/sharptime_04_lifespan_normal
   normalized_t: false
   num_workers: 0
-  pin_memory: true
   resolution: 4
   source_path: /media/data/freetimegs/data/bar-release
   start_frame: 3420
@@ -21,9 +18,9 @@ densify:
   densify_from_iter: 500
   densify_grad_threshold: 0.0001
   densify_interval: 100
-  densify_until_iter: 30000
+  densify_until_iter: 15000
   densify_grad_threshold_final: 0.0001
-  opacity_reset_until_iter: 11999
+  opacity_reset_until_iter: 15000
   prune_opacity_threshold: 0.005
   # Percent of scene extent used as base dense threshold
   percent_dense: 0.01
@@ -62,7 +59,7 @@ optim:
   t_scale_lr: 0.005
   velocity_lr: 0.00016
   r_lr: 0.001
-  opacity_reset_until_iter: 11999
+  opacity_reset_until_iter: 15000
 
 trainer:
   lambda_reg: 0.01
@@ -70,7 +67,7 @@ trainer:
   relocation_interval: 100
   save_interval: 5000
   test_interval: 5000
-  opacity_reset_until_iter: 11999
+  opacity_reset_until_iter: 15000
 
   # Dynamic region focus weighting
   dynamic_weighting_enabled: true
@@ -83,6 +80,11 @@ trainer:
   dynamic_duration_static: 0.5
   dynamic_duration_dynamic: 0.1
   dynamic_mask_threshold: 0.5
+
+  # SharpTimeGS regularization
+  lambda_scale: 0.01       # L_scale: PGSR flatness
+  lambda_lifespan: 0.01     # L_t: lifespan reg (off by default, tune after baseline)
+  lambda_n: 0.01            # L_n: normal-depth consistency (off by default, extra render pass)
 
   # FreeTimeGS++ improvements
   color_correction_enabled: true   # per-camera affine scale+bias, reduces run-to-run variance

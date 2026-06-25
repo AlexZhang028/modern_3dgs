@@ -15,14 +15,12 @@ data:
   # 初始点云配置
   init_point_cloud_path: ""  # 自定义初始点云路径（可选），留空则自动搜索或生成
   
-  # 高级数据加载选项
-  data_device: "cuda"
+  # Data loading
   eval: false
   train_test_exp: false
+  # cache_images=true: cache images in GPU VRAM after first load (requires num_workers=0)
   cache_images: false
-  num_workers: 0 # Disable multi-processing data loading to avoid shared memory issues
-  pin_memory: true
-  lazy_loading: true 
+  num_workers: 0
 
 # ============================================================================
 # 模型配置 (ModelConfig)

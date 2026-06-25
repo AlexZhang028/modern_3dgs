@@ -1,0 +1,95 @@
+data:
+  cache_images: false
+  end_frame: 3010
+  eval: false
+  images: images
+  init_point_cloud_path: '/media/data/freetimegs/data/corgi-release/sharptime_init.ply'
+  model_path: /media/data/freetimegs/res/corgi/baseline_sam2
+  normalized_t: false
+  num_workers: 0
+  resolution: 4
+  source_path: /media/data/freetimegs/data/corgi-release/
+  start_frame: 2950
+  test_cameras:
+  - ''
+  train_cameras: null
+  white_background: false
+
+# ---------------------------------------------------------------------------
+# Ablation: vanilla SharpTimeGS + SAM2 dynamic loss boost, no phase decoupling.
+#
+# Tests whether applying a per-pixel loss multiplier (higher weight on dynamic
+# pixels from SAM2 masks) improves dynamic region quality without the
+# complexity of phase-decoupled gradient routing.
+#
+# The boost ramps from 0 → max_dynamic_boost over [boost_start, boost_end],
+# uniformly weighting dynamic pixels heavier throughout training.
+# No static-gradient zeroing or dynamic-specific densification changes.
+#
+# All other settings identical to corgi_baseline_vanilla.yaml.
+# ---------------------------------------------------------------------------
+
+iterations: 50000
+
+densify:
+  densify_from_iter: 500
+  densify_until_iter: 25000
+  densify_interval: 100
+  densify_grad_threshold: 0.0001
+  densify_grad_threshold_final: 0.0001
+  opacity_reset_until_iter: 12000
+  prune_opacity_threshold: 0.005
+  prune_from_iter: 500
+  percent_dense: 0.01
+  N_split: 2
+  velocity_normalizer: 2.0
+  scale_shrink_multiplier: 2.0
+  min_dynamic_scale_denominator: 1e-6
+  clone_speed_shrink_coeff: 0.75
+  split_scale_shrink_base: 0.8
+
+model:
+  mode: sharptime
+  percent_dense: 0.01
+  sh_degree: 3
+
+optim:
+  feature_lr: 0.0025
+  iterations: 50000
+  lambda_dssim: 0.2
+  opacity_lr: 0.025
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  t_lr: 0.0001
+  t_scale_lr: 0.005
+  velocity_lr: 0.00016
+  r_lr: 0.001
+  opacity_reset_until_iter: 12000
+
+trainer:
+  lambda_reg: 0.01
+  log_interval: 10
+  relocation_interval: 100
+  save_interval: 5000
+  test_interval: 5000
+  opacity_reset_until_iter: 12000
+
+  decouple_training_enabled: false   # no phase decoupling
+  color_correction_enabled: false
+
+  # --- SAM2 dynamic loss boost ----------------------------------------------
+  dynamic_weighting_enabled: true
+  sam2_masks_dir: '/media/data/freetimegs/data/corgi-release/masks'
+  dynamic_boost_start_iter: 500      # active from the start (no phase dependency)
+  dynamic_boost_end_iter: 20000      # ramp over first 20k iters
+  max_dynamic_boost: 4.0
+  dynamic_boost_curve_power: 3.0
+
+  # --- SharpTimeGS regularization -------------------------------------------
+  lambda_scale: 0.01
+  lambda_lifespan: 0.01
+  lambda_n: 0.01
+
+  lambda_motion_blur: 0.0

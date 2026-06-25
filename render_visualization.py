@@ -227,7 +227,6 @@ if __name__ == "__main__":
         test_cameras=selected_cameras if selected_cameras is not None else [],
         start_frame=args.start_frame,
         end_frame=args.end_frame,
-        use_tmp=False,
         cache_images=False,
         lazy_loading=True
     )

@@ -1,0 +1,37 @@
+# SharpTimeGS initialization config for bar-release dataset
+
+dataset:
+  source_path: /media/data/freetimegs/data/bar-release
+  output_path: /media/data/freetimegs/data/bar-release/sharptime_init.ply
+  work_dir:    ""              # default: bar-release/.sharptime_init_work
+  start_frame:    3420
+  end_frame:      -1
+  extract_frames: true     # auto-extract if frames/ not yet present
+
+static:
+  reference_frame: 3420        # use the first training frame as reference
+  colmap_bin:      null
+  skip:            false
+
+flow:
+  model:     large
+  iters:     20
+  threshold: 2.0
+  skip:      false
+
+segmentation:
+  model:           large
+  n_prompt_points: 5
+  offload_to_cpu:  false       # bar has ~60 frames — fits in VRAM
+  skip:            false
+
+dynamic:
+  n_sift_features: 2000
+  match_ratio:     0.75
+  reproj_threshold: 4.0
+  min_matches:     8
+  knn_k:           5
+  skip:            false
+
+device:    cuda
+overwrite: false

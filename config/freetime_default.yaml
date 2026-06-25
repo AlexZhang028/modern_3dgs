@@ -14,13 +14,11 @@ data:
   # 初始点云配置
   init_point_cloud_path: ""  # 自定义初始点云路径（可选），留空则自动搜索或生成
   
-  # 资源管理
-  data_device: "cuda"
+  # Data loading
   eval: false
-  cache_images: false # 显存优化：如果不缓存图像，每次迭代从 CPU 读取
+  # cache_images=true: cache images in GPU VRAM after first load (requires num_workers=0)
+  cache_images: false
   num_workers: 0
-  pin_memory: true
-  lazy_loading: true # 推荐开启，避免一次性加载所有视频帧
 
 # ============================================================================
 # 模型配置 (ModelConfig)

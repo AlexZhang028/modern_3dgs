@@ -7,7 +7,6 @@ Supports COLMAP, NeRF Synthetic (Blender), and SelfCap/EasyVolcap dataset format
 import os
 import sys
 import json
-import shutil
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -45,7 +44,6 @@ class GaussianDataset(Dataset):
         test_camera_names: Optional[List[str]] = None,
         train_camera_names: Optional[List[str]] = None,
         normalized_t: bool = True,
-        use_tmp: bool = False,
         inference_only: bool = False,
     ):
         """
@@ -66,7 +64,6 @@ class GaussianDataset(Dataset):
             test_camera_names: List of camera names to exclude from training (used as test set)
             train_camera_names: List of camera names to use for training (overrides default split)
             normalized_t: Whether to use normalized time [0,1] or seconds.
-            use_tmp: Use temporary directory for extracted frames.
             inference_only: Do not preload or extract frames, only load camera params.
         """
         self.source_path = source_path
@@ -85,8 +82,7 @@ class GaussianDataset(Dataset):
         self.test_camera_names = test_camera_names if test_camera_names is not None else []
         self.train_camera_names = train_camera_names if train_camera_names is not None else []
         self.normalized_t = normalized_t
-        self.fps = -1.0 
-        self.use_tmp = use_tmp
+        self.fps = -1.0
         self.inference_only = inference_only
 
         # Store camera info
@@ -780,254 +776,92 @@ class SelfCapVideoDataset(GaussianDataset):
                     timestamp_seconds=time_sec
                 )
                 
-                # Store video info
+                # Store video source for extraction; will be replaced with _image_path below
                 camera._video_path = video_path
                 camera._frame_idx = eff_idx
-                
+
                 all_cameras.append(camera)
 
         self.cameras = all_cameras
         self._compute_scene_normalization()
         self._load_initial_point_cloud()
         print(f"Loaded {len(self.cameras)} frames from SelfCap Video dataset")
-        
-        # In viewer/inference mode where we don't need GT images or use lazy loading blindly
-        # we might skip preloading/extracting entirely if caching is off
+
         if self.inference_only:
-            print("Skipping frame extraction/preloading (Inference Only mode).")
+            print("Skipping frame extraction (inference-only mode).")
             return
-            
-        # Preload Video Frames optimization
-        if self.use_tmp:
-            self._extract_frames_to_tmp()
-        else:
-            # Always preload for video datasets to avoid random seek I/O bottleneck
-            target_device = self.cache_device if self.cache_device else "cpu"
-            print(f"Preloading video frames into memory ({target_device}) (Sequential Read Optimization)...")
-            self._preload_video_frames(target_device)
-            
-    def _extract_frames_to_tmp(self):
-        """Extract frames to temporary directory to avoid Random Seek I/O and RAM usage."""
-        tmp_dir = os.path.join(self.source_path, f"tmp_frames_{self.split}")
-        # Ensure fresh start
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
-        os.makedirs(tmp_dir, exist_ok=True)
-        self.tmp_dir = tmp_dir
-        
-        print(f"Extracting frames to temporary directory: {tmp_dir}")
-        print("Note: Ideally this should go to SSD. HDD extraction might be slow but training will be fast.")
-        
-        # Group cameras by video file
-        video_groups = {}
+
+        # Auto-extract frames to disk on first use; subsequent loads read from files directly.
+        frames_root = Path(self.source_path) / "frames"
+        first_cam = cam_names[0] if cam_names else None
+        already_extracted = (
+            first_cam is not None
+            and (frames_root / first_cam).is_dir()
+            and any((frames_root / first_cam).iterdir())
+        )
+        if not already_extracted:
+            print(f"Frames not found at {frames_root}, extracting permanently...")
+            self._extract_frames_permanently(frames_root)
+
+        # Point all cameras at their extracted JPEG files.
         for cam in self.cameras:
-            if hasattr(cam, '_video_path'):
-                if cam._video_path not in video_groups:
-                    video_groups[cam._video_path] = []
-                video_groups[cam._video_path].append(cam)
-        
+            cam_name = cam.image_name.rsplit("_frame_", 1)[0]
+            eff_idx = cam._frame_idx
+            cam._image_path = str(frames_root / cam_name / f"{eff_idx:05d}.jpg")
+            del cam._video_path
+            del cam._frame_idx
+            
+    def _extract_frames_permanently(self, frames_root: Path) -> None:
+        """Extract all camera frames from videos to {frames_root}/{cam_name}/{eff_idx:05d}.jpg."""
         from tqdm import tqdm
-        
-        for video_path, cams in video_groups.items():
-            # Sort by frame index
-            cams.sort(key=lambda c: c._frame_idx)
-            
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"Warning: Could not open {video_path}")
-                continue
 
-            max_frame = cams[-1]._frame_idx
-            
-            # Map frame_idx -> list of cams (for efficiency)
-            frame_to_cams = {}
-            for c in cams:
-                if c._frame_idx not in frame_to_cams: frame_to_cams[c._frame_idx] = []
-                frame_to_cams[c._frame_idx].append(c)
-                
-            pbar = tqdm(total=max_frame+1, desc=f"Extracting {os.path.basename(video_path)}", leave=False)
-            current_frame = 0
-            extracted_count = 0
-            
-            while current_frame <= max_frame:
-                if current_frame in frame_to_cams:
-                    ret, frame = cap.read()
-                    if not ret: break
-                    
-                    # We extract FULL resolution to maintain consistency with _load_camera_image logic
-                    # which applies downscaling based on self.resolution.
-                    # Using JPEG for speed and space efficiency (Quality 95 defaults usually fine)
-                    
-                    target_cams = frame_to_cams[current_frame]
-                    img_name = target_cams[0].image_name
-                    file_name = f"{img_name}.jpg" 
-                    file_path = os.path.join(tmp_dir, file_name)
-                    
-                    cv2.imwrite(file_path, frame)
-                    
-                    # Update all cameras to point to this file
-                    for c in target_cams:
-                        c._image_path = file_path
-                        # Remove video deps so _load_camera_image uses standard file loader
-                        if hasattr(c, '_video_path'): del c._video_path
-                        if hasattr(c, '_frame_idx'): del c._frame_idx
-                            
-                    extracted_count += 1
-                else:
-                    # Skip frame
-                    cap.grab()
-                
-                current_frame += 1
-                pbar.update(1)
-            
-            pbar.close()
-            cap.release()
-            print(f"   Extracted {extracted_count} frames for {os.path.basename(video_path)}")
-            
-    def cleanup_tmp(self):
-        """Cleanup temporary directory."""
-        if hasattr(self, 'tmp_dir') and os.path.exists(self.tmp_dir):
-            print(f"Cleaning up temporary directory: {self.tmp_dir}")
-            try:
-                shutil.rmtree(self.tmp_dir)
-            except Exception as e:
-                print(f"Warning: Failed to cleanup temp dir: {e}")
-
-    def _preload_video_frames(self, device="cpu"):
-        """Preload all frames sequentially to avoid random seek overhead."""
-        # 1. Group cameras by video file
-        video_groups = {}
+        # Group cameras by video path for sequential read
+        video_groups: dict = {}
         for cam in self.cameras:
-            if hasattr(cam, '_video_path'):
-                if cam._video_path not in video_groups:
-                    video_groups[cam._video_path] = []
-                video_groups[cam._video_path].append(cam)
-        
-        # 2. Process each video
+            vp = cam._video_path
+            if vp not in video_groups:
+                video_groups[vp] = []
+            video_groups[vp].append(cam)
+
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+
         for video_path, cams in video_groups.items():
-            # Sort cams by frame index
             cams.sort(key=lambda c: c._frame_idx)
-            
+            needed: dict = {}
+            for c in cams:
+                needed.setdefault(c._frame_idx, []).append(c)
+
+            max_frame = max(needed)
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                print(f"Warning: Could not preload {video_path}")
+                print(f"Warning: Cannot open {video_path}, skipping.")
                 continue
-                
-            current_frame = 0
-            loaded_count = 0
-            
-            # Optimization: Only read frames we need. 
-            # If dataset is sparse (e.g. frame 0, 10, 20), skip frames instead of decoding.
-            # But cap.grab() is faster than read().
-            
-            # Get max frame needed
-            max_frame = cams[-1]._frame_idx
-            cam_indices = {c._frame_idx: i for i, c in enumerate(cams)}
-            
-            from tqdm import tqdm
-            pbar = tqdm(total=max_frame+1, desc=f"Loading {os.path.basename(video_path)}", leave=False)
-            
-            while current_frame <= max_frame:
-                if current_frame in cam_indices:
-                     ret, frame = cap.read()
-                     if not ret: 
-                         break
-                     
-                     # Process frame
-                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                     
-                     if self.resolution in [1, 2, 4, 8]:
-                        new_w = frame.shape[1] // self.resolution
-                        new_h = frame.shape[0] // self.resolution
-                        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                     elif self.resolution > 0:
-                        frame = cv2.resize(frame, (self.resolution, self.resolution))
-                        
-                     image_tensor = torch.from_numpy(frame).float() / 255.0
-                     image_tensor = image_tensor.permute(2, 0, 1)
-                     
-                     # Check if we should move to GPU immediately?
-                     # data_device usually handles this. Here we store in RAM or cache_device
-                     # If cache_device is 'cuda', we move it.
-                     if device == "cuda":
-                         image_tensor = image_tensor.cuda()
-                     
-                     # Assign to all cameras sharing this frame (unlikely but possible)
-                     # In our list, multiple cams might point to same frame? 
-                     # The grouping logic above put cams in a list. 
-                     # Simply find the cam(s) with this index.
-                     # Since we sorted, we can just look.
-                     # Actually, multiple cams implies multiple views, but here video_path is unique per view? 
-                     # Usually SelfCap is monocular video or multi-view videos. 
-                     # In our loader, 'name' mapped to 'video_path'. So unique per camera.
-                     
-                     # Find camera object in our list
-                     # We might have duplicates if we have multiple cameras pointing to SAME video/frame 
-                     # (not typical for this dataset structure).
-                     
-                     # Find matches efficiently
-                     # Iterate original filtered cams list
-                     for c in cams:
-                         if c._frame_idx == current_frame:
-                             c.image = image_tensor
-                             c.alpha_mask = torch.ones(1, image_tensor.shape[1], image_tensor.shape[2], device=image_tensor.device)
-                             self._sync_camera_raster_size(c, c.image)
-                             
-                             # Manually populate cache dict so __getitem__ sees it
-                             # Note: caching in `self.image_cache` uses dataset index as key.
-                             # We need to look up the dataset index (uid is usually the index in self.cameras)
-                             self.image_cache[c.uid] = {
-                                 "image": c.image,
-                                 "alpha_mask": c.alpha_mask
-                             }
-                             loaded_count += 1
+
+            saved = 0
+            current = 0
+            pbar = tqdm(total=max_frame + 1,
+                        desc=f"  {os.path.basename(video_path)}", leave=False)
+
+            while current <= max_frame:
+                if current in needed:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Derive cam_name from any camera at this frame
+                    cam_name = needed[current][0].image_name.rsplit("_frame_", 1)[0]
+                    out_dir = frames_root / cam_name
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    out_path = out_dir / f"{current:05d}.jpg"
+                    cv2.imwrite(str(out_path), frame, encode_params)
+                    saved += 1
                 else:
-                    # Skip frame
                     cap.grab()
-                
-                current_frame += 1
+                current += 1
                 pbar.update(1)
-            
+
             pbar.close()
             cap.release()
-            print(f"   Preloaded {loaded_count} frames for {os.path.basename(video_path)}")
-
-    def _load_camera_image(self, camera: Camera):
-        """Load specific frame from video."""
-        if not hasattr(camera, '_video_path'):
-             # Fallback to standard if we mixed types
-             return super()._load_camera_image(camera)
-
-        cap = cv2.VideoCapture(camera._video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, camera._frame_idx)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            print(f"Error reading frame {camera._frame_idx} from {camera._video_path}")
-            # return black image?
-            frame = np.zeros((camera.height, camera.width, 3), dtype=np.uint8)
-        else:
-             # BGR -> RGB
-             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-             
-        # Handle resolution (dataset arg)
-        # If resolution is small integer (1, 2, 4, 8...), treat as downscale factor
-        if self.resolution in [1, 2, 4, 8]:
-            new_w = frame.shape[1] // self.resolution
-            new_h = frame.shape[0] // self.resolution
-            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        elif self.resolution > 0:
-             # Force square/specific size (legacy behavior)
-             frame = cv2.resize(frame, (self.resolution, self.resolution))
-             
-        # To Tensor
-        image_tensor = torch.from_numpy(frame).float() / 255.0 # [H, W, 3]
-        image_tensor = image_tensor.permute(2, 0, 1) # [3, H, W]
-        
-        camera.image = image_tensor
-        camera.alpha_mask = torch.ones(1, image_tensor.shape[1], image_tensor.shape[2])
-        self._sync_camera_raster_size(camera, camera.image)
+            print(f"  {os.path.basename(video_path)}: saved {saved} frames → {frames_root}")
 
 
 def collate_fn(batch: List[Dict]) -> Dict:

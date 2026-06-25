@@ -6,14 +6,17 @@ Unified training framework supporting Static, FreeTime, and SharpTime modes.
 
 import time
 import math
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from tqdm import tqdm
 
 from config.config import TrainerConfig, DataConfig
 from utils.image_utils import psnr
+from utils.general_utils import build_rotation
 from core.loss import l1_loss, ssim, fast_ssim, GaussianLoss
 from core.densify import (
     GaussianDensifier, DensificationConfig,
@@ -389,7 +392,9 @@ class Trainer:
         }
         timing['loss_ms'] = (time.perf_counter() - t0) * 1000.0
         
-        # Loss Hook
+        # Loss Hook — expose camera/timestamp to subclass hooks via self
+        self._current_camera = camera
+        self._current_timestamp = timestamp
         t0 = time.perf_counter()
         loss = self._compute_loss_hook(loss, rendered, iteration)
         timing['loss_hook_ms'] = (time.perf_counter() - t0) * 1000.0
@@ -943,25 +948,21 @@ class FreeTimeTrainer(Trainer):
 
         joint_end   = getattr(self.config, 'decouple_joint_end_iter',   15000)
         dynamic_end = getattr(self.config, 'decouple_dynamic_end_iter', 30000)
-        if iteration <= joint_end:
+
+        # Phase 1 (joint) or past Phase 2 (joint refinement): no routing
+        if iteration <= joint_end or iteration > dynamic_end:
             return
 
+        # Phase 2 only: zero static Gaussian gradients so densification
+        # and optimization focus on dynamic Gaussians.
         with torch.no_grad():
-            is_static   = self._get_static_mask()
-            freeze_mask = is_static if iteration <= dynamic_end else ~is_static
-            if not freeze_mask.any():
+            is_static = self._get_static_mask()
+            if not is_static.any():
                 return
-
             for key in ['xyz', 'features_dc', 'features_rest', 'opacity', 'scaling', 'rotation']:
                 p = self.model._gaussian_params.get(key)
                 if p is not None and p.grad is not None:
-                    p.grad[freeze_mask] = 0.0
-
-            if iteration > dynamic_end:
-                for key in ['t', 't_scale', 'motion']:
-                    p = self.model._gaussian_params.get(key)
-                    if p is not None and p.grad is not None:
-                        p.grad[freeze_mask] = 0.0
+                    p.grad[is_static] = 0.0
 
     # ------------------------------------------------------------------ #
     #  Dynamic region focus weighting                                      #
@@ -972,73 +973,114 @@ class FreeTimeTrainer(Trainer):
         if not use_dynamic_weighting:
             return 1.0, 0.0, {}
 
-        boost_start_iter = getattr(self.config, 'dynamic_boost_start_iter', 15000)
-        boost_end_iter   = getattr(self.config, 'dynamic_boost_end_iter',   20000)
+        boost_start_iter  = getattr(self.config, 'dynamic_boost_start_iter', 15000)
+        boost_end_iter    = getattr(self.config, 'dynamic_boost_end_iter',   20000)
         max_dynamic_boost = getattr(self.config, 'max_dynamic_boost', 5.0)
-        curve_power = max(getattr(self.config, 'dynamic_boost_curve_power', 3.0), 1e-6)
+        curve_power       = max(getattr(self.config, 'dynamic_boost_curve_power', 3.0), 1e-6)
 
         if iteration < boost_start_iter:
-            current_boost = 0.0
-        elif iteration < boost_end_iter and boost_end_iter > boost_start_iter:
-            progress = (iteration - boost_start_iter) / float(boost_end_iter - boost_start_iter)
+            return 1.0, 0.0, {'dynamic_boost': 0.0}
+
+        if iteration < boost_end_iter and boost_end_iter > boost_start_iter:
+            progress       = (iteration - boost_start_iter) / float(boost_end_iter - boost_start_iter)
             eased_progress = (math.exp(curve_power * progress) - 1.0) / (math.exp(curve_power) - 1.0)
-            current_boost = max_dynamic_boost * eased_progress
+            current_boost  = max_dynamic_boost * eased_progress
         else:
             current_boost = max_dynamic_boost
 
         if current_boost <= 0.0:
-            return 1.0, 0.0, {'dynamic_boost': 0.0, 'dynamic_map_mean': 0.0,
-                               'dynamic_map_max': 0.0, 'dynamic_multiplier_mean': 1.0,
-                               'dynamic_multiplier_max': 1.0}
+            return 1.0, 0.0, {'dynamic_boost': 0.0}
 
-        cache_interval = getattr(self.config, 'dynamic_weight_cache_update_interval', 10000)
-        view_id = getattr(camera, 'image_name', None) or f"view_{getattr(camera, 'index', '0')}"
+        t0   = time.perf_counter()
+        mask = self._load_sam2_mask(camera)
+        if mask is None:
+            # No SAM2 masks configured or available: skip boost for this view
+            return 1.0, (time.perf_counter() - t0) * 1000.0, {
+                'dynamic_boost': current_boost, 'dynamic_map_mean': 0.0,
+            }
 
-        cached_entry = self.dynamic_weight_cache.get(view_id)
-        need_update = cached_entry is None or (iteration - cached_entry.get('iter', -1)) >= cache_interval
-
-        t_weight = time.perf_counter()
-        if need_update:
-            with torch.no_grad():
-                override_colors = self._get_dynamic_score().repeat(1, 3)
-                weight_out = self.renderer(
-                    gaussians=self.model, camera=camera,
-                    bg_color=torch.zeros(3, device="cuda"),
-                    timestamp=timestamp, enable_culling=False,
-                    colors_override=override_colors,
-                )
-                dyn_cpu = weight_out['render'][0:1].detach().cpu()
-                self.dynamic_weight_cache[view_id] = {'map': dyn_cpu, 'iter': iteration}
-                del weight_out
-        else:
-            dyn_cpu = cached_entry['map']
-
-        cache_hit = 0.0 if need_update else 1.0
-        if self.writer is not None:
-            try:
-                self.writer.add_scalar('DynamicWeight/cache_hit', cache_hit, iteration)
-            except Exception:
-                pass
-
-        multiplier = 1.0 + current_boost * dyn_cpu.cuda()
-        timing_ms = (time.perf_counter() - t_weight) * 1000.0
-        extra = {
-            'dynamic_boost':            current_boost,
-            'dynamic_map_mean':         float(dyn_cpu.mean()),
-            'dynamic_map_max':          float(dyn_cpu.max()),
-            'dynamic_multiplier_mean':  multiplier.mean().item(),
-            'dynamic_multiplier_max':   multiplier.max().item(),
+        # mask: [1, H, W] float32 in [0, 1], 1 = dynamic pixel
+        # multiplier: 1.0 in static regions, (1 + boost) in dynamic regions
+        multiplier = 1.0 + current_boost * mask
+        timing_ms  = (time.perf_counter() - t0) * 1000.0
+        return multiplier, timing_ms, {
+            'dynamic_boost':           current_boost,
+            'dynamic_map_mean':        mask.mean().item(),
+            'dynamic_multiplier_mean': multiplier.mean().item(),
+            'dynamic_multiplier_max':  multiplier.max().item(),
         }
-        return multiplier, timing_ms, extra
+
+    def _load_sam2_mask(self, camera: Any) -> Optional[torch.Tensor]:
+        """Load SAM2 dynamic mask for a camera, resized to training resolution.
+
+        Mask files follow the sharptime_init convention:
+            {sam2_masks_dir}/{cam_name}/{eff_idx:05d}.png
+        where cam_name and eff_idx are encoded in camera.image_name as
+            "{cam_name}_frame_{eff_idx:05d}".
+
+        Returns a [1, H, W] float32 tensor on the model device (0=static,
+        1=dynamic), or None when masks are unavailable or not configured.
+        Results are cached as uint8 numpy arrays to bound memory usage.
+        """
+        import cv2 as _cv2
+
+        # Lazy init of cache and configured directory
+        if not hasattr(self, '_sam2_mask_cache'):
+            self._sam2_mask_cache: Dict[Tuple, Optional[np.ndarray]] = {}
+            self._sam2_masks_dir: Optional[str] = (
+                getattr(self.config, 'sam2_masks_dir', '') or None
+            )
+            if self._sam2_masks_dir:
+                print(f"[trainer] SAM2 mask boost enabled: {self._sam2_masks_dir}")
+
+        if not self._sam2_masks_dir:
+            return None
+
+        img_name = getattr(camera, 'image_name', '') or ''
+        if '_frame_' not in img_name:
+            return None
+        cam_name, eff_str = img_name.rsplit('_frame_', 1)
+        try:
+            eff_idx = int(eff_str)
+        except ValueError:
+            return None
+
+        target_h, target_w = camera.height, camera.width
+        cache_key: Tuple = (cam_name, eff_idx, target_h, target_w)
+
+        if cache_key in self._sam2_mask_cache:
+            cached = self._sam2_mask_cache[cache_key]
+            if cached is None:
+                return None
+            return torch.from_numpy(cached.astype(np.float32) / 255.0).unsqueeze(0).to(self.model.device)
+
+        mask_path = Path(self._sam2_masks_dir) / cam_name / f"{eff_idx:05d}.png"
+        if not mask_path.exists():
+            self._sam2_mask_cache[cache_key] = None
+            return None
+
+        mask_u8 = _cv2.imread(str(mask_path), _cv2.IMREAD_GRAYSCALE)
+        if mask_u8 is None:
+            self._sam2_mask_cache[cache_key] = None
+            return None
+
+        if mask_u8.shape != (target_h, target_w):
+            mask_u8 = _cv2.resize(mask_u8, (target_w, target_h), interpolation=_cv2.INTER_NEAREST)
+
+        self._sam2_mask_cache[cache_key] = mask_u8
+        return torch.from_numpy(mask_u8.astype(np.float32) / 255.0).unsqueeze(0).to(self.model.device)
 
     # ------------------------------------------------------------------ #
     #  Loss hook                                                           #
     # ------------------------------------------------------------------ #
 
-    def _compute_loss_hook(self, loss: torch.Tensor, rendered: Dict, iteration: int) -> torch.Tensor:
-        reg_weight = self.config.lambda_reg
+    def _compute_opacity_reg(self, loss: torch.Tensor, rendered: Dict) -> torch.Tensor:
+        """L_opacity = λ_reg · mean(O · stopGrad(l(t))). Shared by FreeTime and SharpTime."""
         l_reg = (rendered['base_opacity'] * rendered['temporal_weight'].detach()).mean()
-        loss += reg_weight * l_reg
+        return loss + self.config.lambda_reg * l_reg
+
+    def _compute_loss_hook(self, loss: torch.Tensor, rendered: Dict, iteration: int) -> torch.Tensor:
+        loss = self._compute_opacity_reg(loss, rendered)
 
         if iteration > getattr(self.config, 'motion_blur_start_iter', 15000) \
                 and hasattr(self.model, '_motion') and self.model._motion is not None:
@@ -1147,8 +1189,17 @@ class SharpTimeTrainer(FreeTimeTrainer):
     def _compute_loss_hook(
         self, loss: torch.Tensor, rendered: Dict, iteration: int
     ) -> torch.Tensor:
-        # Inherit FreeTimeGS 4D regularization (L_opacity equivalent)
-        loss = super()._compute_loss_hook(loss, rendered, iteration)
+        # L_opacity only — skip FreeTimeGS motion-blur penalty (not part of SharpTimeGS)
+        loss = self._compute_opacity_reg(loss, rendered)
+
+        # L_scale: PGSR flatness regularization
+        # L_scale = 1/N Σ min(s_i)  — penalizes the thinnest axis being non-zero,
+        # pushing Gaussians toward flat disc/plane shapes on the surface.
+        lambda_scale = getattr(self.config, 'lambda_scale', 0.0)
+        if lambda_scale > 0.0:
+            scales  = self.model.get_scaling           # [N, 3], exp-activated
+            L_scale = scales.min(dim=-1).values.mean()
+            loss   += lambda_scale * L_scale
 
         # L_t: lifespan regularization (SharpTimeGS eq. 7-8)
         # L_t = 1/N Σ 1/√(-2·log(o_th)·σ_t² + r)
@@ -1163,7 +1214,79 @@ class SharpTimeTrainer(FreeTimeTrainer):
             L_t     = (1.0 / torch.sqrt(denom)).mean()
             loss    += lambda_t * L_t
 
+        # L_n: single-view normal–depth consistency
+        lambda_n = getattr(self.config, 'lambda_n', 0.0)
+        if lambda_n > 0.0:
+            camera    = getattr(self, '_current_camera', None)
+            timestamp = getattr(self, '_current_timestamp', 0.0)
+            if camera is not None:
+                L_n   = self._compute_ln(rendered, camera, timestamp)
+                loss += lambda_n * L_n
+
         return loss
+
+    # ------------------------------------------------------------------ #
+    #  L_n helpers                                                         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _depth_to_normal(depth: torch.Tensor, camera) -> torch.Tensor:
+        """Finite-difference surface normals from depth map (camera space, detached)."""
+        H, W = depth.shape[1:]
+        fx = W / (2.0 * math.tan(camera.FovX / 2.0))
+        fy = H / (2.0 * math.tan(camera.FovY / 2.0))
+        cx, cy = W * 0.5, H * 0.5
+
+        u = torch.arange(W, device=depth.device, dtype=torch.float32)
+        v = torch.arange(H, device=depth.device, dtype=torch.float32)
+        vv, uu = torch.meshgrid(v, u, indexing='ij')   # [H, W] each
+
+        z   = depth[0]                                  # [H, W]
+        pts = torch.stack([
+            (uu - cx) / fx * z,
+            (vv - cy) / fy * z,
+            z,
+        ], dim=0)                                       # [3, H, W]
+
+        # Central differences → cross product → unit normal
+        du = F.pad(pts[:, :, 2:] - pts[:, :, :-2], (1, 1))         # [3, H, W]
+        dv = F.pad(pts[:, 2:, :] - pts[:, :-2, :], (0, 0, 1, 1))   # [3, H, W]
+        n  = torch.cross(du, dv, dim=0)
+        return F.normalize(n, dim=0).detach()           # target → no grad
+
+    def _get_gaussian_normals_cam(self, camera) -> torch.Tensor:
+        """Per-Gaussian normals (smallest-scale axis) transformed to camera space."""
+        R_mat   = build_rotation(self.model.get_rotation)  # [N, 3, 3]
+        scales  = self.model.get_scaling                   # [N, 3]
+        min_idx = scales.argmin(dim=-1)                    # [N]
+        N       = R_mat.shape[0]
+        normals_w = R_mat[torch.arange(N, device=R_mat.device), :, min_idx]  # [N, 3]
+
+        # world_view_transform is W2V^T; .T gives actual W2V [4,4]
+        R_w2c     = camera.world_view_transform.T[:3, :3].float()
+        normals_c = normals_w @ R_w2c.T                    # [N, 3]
+        return F.normalize(normals_c, dim=-1)
+
+    def _compute_ln(
+        self, rendered: Dict, camera, timestamp: float
+    ) -> torch.Tensor:
+        """L_n = mean(1 - dot(rendered_normal, depth_normal))."""
+        depth_normal = self._depth_to_normal(rendered['depth'], camera)  # [3,H,W]
+
+        # Map Gaussian normals [-1,1] → [0,1] for rasterizer, then back
+        normals_color = (self._get_gaussian_normals_cam(camera) + 1.0) * 0.5  # [N,3]
+
+        normal_map = self.renderer(
+            gaussians=self.model,
+            camera=camera,
+            bg_color=torch.zeros(3, device='cuda'),
+            timestamp=timestamp,
+            colors_override=normals_color,
+            enable_culling=False,
+        )['render']                                      # [3, H, W]
+        normal_map = F.normalize(normal_map * 2.0 - 1.0, dim=0)  # back to [-1,1]
+
+        return (1.0 - (normal_map * depth_normal).sum(dim=0)).mean()
 
     # ------------------------------------------------------------------ #
     #  Metrics logging                                                     #

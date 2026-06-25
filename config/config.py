@@ -31,13 +31,11 @@ class DataConfig:
     init_point_cloud_path: str = ""  # Custom initial point cloud path (optional)
     
     # Data Loading
-    data_device: str = "cuda"  # Device to load data to
     eval: bool = False  # Evaluation mode
     train_test_exp: bool = False  # Use train/test exposure compensation
-    cache_images: bool = True  # Cache images to memory/VRAM
-    num_workers: int = 4  # DataLoader workers
-    pin_memory: bool = True  # Use pin_memory
-    lazy_loading: bool = False  # Lazy loading (False = preload all images)
+    # cache_images=True: images are cached in GPU VRAM after first load (requires num_workers=0)
+    cache_images: bool = True  # Cache images in VRAM; set num_workers=0 when enabled
+    num_workers: int = 4  # DataLoader workers (set to 0 when cache_images=True)
     normalized_t: bool = False # Use normalized time (0-1) or seconds for dataset loading
     
     # SelfCap / Video Dataset Options
@@ -46,7 +44,6 @@ class DataConfig:
     test_cameras: List[str] = field(default_factory=list)  # List of camera names to use for testing
     train_cameras: List[str] = field(default_factory=list)  # List of camera names to use for training
     fps: float = -1.0 # Override FPS for video datasets (-1 = auto)
-    use_tmp: bool = True # Use temporary directory for frame extraction (reduces IO bottleneck, cleans up after)
     inference_only: bool = False # Do not preload or extract frames, only load camera params.
 
 
@@ -247,6 +244,7 @@ class TrainerConfig:
     opacity_reset_until_iter: int = 15_000
     prune_opacity_threshold: float = 0.005
     prune_size_threshold: float = 20.0
+    max_num_gaussians: int = -1  # Hard cap: skip clone/split when count >= this (-1 = disabled)
     
     # Loss Weights
     lambda_dssim: float = 0.2
@@ -281,18 +279,26 @@ class TrainerConfig:
 
     # Phase-based decoupled training (FreeTimeGS)
     # Phase 1 (0 ~ joint_end):          joint training, both static/dynamic updated freely
-    # Phase 2 (joint_end ~ dynamic_end): dynamic focus, static Gaussian grads zeroed
-    # Phase 3 (dynamic_end ~ end):       static focus,  dynamic Gaussian grads zeroed
+    # Phase 2 (joint_end ~ dynamic_end): dynamic focus, static Gaussian grads zeroed,
+    #                                    dynamic Gaussian grad accum boosted for densification
+    # After dynamic_end:                 joint refinement, no gradient routing
     decouple_training_enabled: bool = False
     decouple_joint_end_iter: int = 15000
     decouple_dynamic_end_iter: int = 30000
     decouple_static_duration_threshold: float = 0.5  # exp(t_scale) > threshold -> static
-    # Phase 2 densification: lower threshold and higher N_split for dynamic Gaussians
-    decouple_dynamic_densify_mult: float = 0.5   # grad threshold multiplier in Phase 2
+    # Phase 2 densification: boost dynamic grad accum and higher N_split
+    decouple_dynamic_densify_mult: float = 0.5   # dynamic grad accum scale (< 1 → boost)
     decouple_dynamic_n_split: int = 3             # N_split override for dynamic Gaussians in Phase 2
+
+    # SAM2 mask directory for dynamic loss weighting (replaces model-rendered dynamic map)
+    # Set to the masks/ directory from the sharptime_init pipeline. Empty = disabled (falls
+    # back to the model-rendered temporal weight map).
+    sam2_masks_dir: str = ""
 
     # SharpTimeGS Regularization
     lambda_lifespan: float = 0.0  # L_t: encourages Gaussians to extend their lifespan (eq.7-8)
+    lambda_scale: float = 0.0     # L_scale: PGSR-style flatness reg, penalizes min scale axis
+    lambda_n: float = 0.0         # L_n: single-view normal–depth consistency
 
 # ============================================================================
 # Full Training Configuration

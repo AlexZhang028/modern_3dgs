@@ -1,0 +1,109 @@
+data:
+  cache_images: false
+  end_frame: 3010
+  eval: false
+  images: images
+  init_point_cloud_path: '/media/data/freetimegs/data/corgi-release/sharptime_init.ply'
+  model_path: /media/data/freetimegs/res/corgi/exp_D_extended_dynamic
+  normalized_t: false
+  num_workers: 0
+  resolution: 4
+  source_path: /media/data/freetimegs/data/corgi-release/
+  start_frame: 2950
+  test_cameras:
+  - ''
+  train_cameras: null
+  white_background: false
+
+# ---------------------------------------------------------------------------
+# Exp D: Extended Phase 2 (dynamic focus phase)
+#
+#   Hypothesis: 15k iters of Phase 2 (10k→25k) is too short for the dynamic
+#   Gaussians to fully adapt. Extending Phase 2 to 30k gives 20k iters of
+#   focused dynamic training, though the refine phase shrinks to 20k.
+#
+#   Changes from baseline (corgi_edge_optim):
+#     decouple_dynamic_end_iter: 25000 → 30000  (Phase 2: 15k → 20k iters)
+#     densify_until_iter:         25000 → 30000  (densification covers full Phase 2)
+#     dynamic_boost_end_iter:     15000 → 22000  (SAM2 boost matches extended Phase 2)
+#
+#   Trade-off: refine phase shrinks from 25k to 20k iters. Static quality
+#   may be marginally worse; dynamic quality expected to improve.
+# ---------------------------------------------------------------------------
+
+iterations: 50000
+
+densify:
+  densify_from_iter: 500
+  # [D] Covers the full extended Phase 2
+  densify_until_iter: 30000
+  densify_interval: 100
+  densify_grad_threshold: 0.0001
+  densify_grad_threshold_final: 0.0001
+  opacity_reset_until_iter: 12000
+  prune_opacity_threshold: 0.005
+  prune_from_iter: 500
+  percent_dense: 0.01
+  N_split: 2
+  max_num_gaussians: 4500000      # hard cap: skip densify above this to prevent OOM
+  velocity_normalizer: 2.0
+  scale_shrink_multiplier: 2.0
+  min_dynamic_scale_denominator: 1e-6
+  clone_speed_shrink_coeff: 0.75
+  split_scale_shrink_base: 0.8
+
+model:
+  mode: sharptime
+  percent_dense: 0.01
+  sh_degree: 3
+
+optim:
+  feature_lr: 0.0025
+  iterations: 50000
+  lambda_dssim: 0.2
+  opacity_lr: 0.025
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  t_lr: 0.0001
+  t_scale_lr: 0.005
+  velocity_lr: 0.00016
+  r_lr: 0.001
+  opacity_reset_until_iter: 12000
+
+trainer:
+  lambda_reg: 0.01
+  log_interval: 10
+  relocation_interval: 100
+  save_interval: 5000
+  test_interval: 5000
+  opacity_reset_until_iter: 12000
+
+  decouple_training_enabled: true
+  decouple_joint_end_iter: 10000
+  # [D] Phase 2 extended by 5k iters
+  decouple_dynamic_end_iter: 30000
+  decouple_static_duration_threshold: 0.5
+  decouple_dynamic_densify_mult: 0.5
+  decouple_dynamic_n_split: 3
+
+  dynamic_weighting_enabled: true
+  sam2_masks_dir: '/media/data/freetimegs/data/corgi-release/masks'
+  dynamic_boost_start_iter: 10000
+  # [D] SAM2 boost ramp matches the extended Phase 2 window
+  dynamic_boost_end_iter: 22000
+  max_dynamic_boost: 4.0
+  dynamic_boost_curve_power: 3.0
+
+  lambda_scale: 0.01
+  lambda_lifespan: 0.01
+  lambda_n: 0.01
+
+  color_correction_enabled: true
+  cc_lr: 0.001
+  lambda_cc: 0.001
+
+  motion_blur_start_iter: 15000
+  lambda_motion_blur: 0.05
+  motion_blur_speed_threshold: 2.0

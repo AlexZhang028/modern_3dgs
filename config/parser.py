@@ -47,7 +47,6 @@ def parse_args():
     parser.add_argument("--test_views", nargs='+', type=str, default=None, help="Specific cameras for testing (overrides config)")
     parser.add_argument("--normalized_t", type=int, default=None, help="Use normalized time (0/1) or seconds. 1=True, 0=False")
     parser.add_argument("--fps", type=float, default=None, help="Override video FPS")
-    parser.add_argument("--use_tmp", action="store_true", help="Use temporary directory for frames")
     parser.add_argument("--lambda_lpips", type=float, default=None, help="LPIPS loss weight")
     
     # Debug Arguments
@@ -115,10 +114,6 @@ def merge_configs(yaml_config: dict, args: argparse.Namespace) -> dict:
     if args.fps is not None:
         if 'data' not in config: config['data'] = {}
         config['data']['fps'] = args.fps
-        
-    if args.use_tmp:
-        if 'data' not in config: config['data'] = {}
-        config['data']['use_tmp'] = True
         
     # View Selection Overrides
     if args.train_views:
@@ -217,6 +212,7 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         opacity_reset_until_iter=getattr(optim_config, 'opacity_reset_until_iter', 15000),
         prune_opacity_threshold=densify_dict.get('prune_opacity_threshold', 0.005),
         prune_size_threshold=densify_dict.get('prune_size_threshold', 20.0),
+        max_num_gaussians=densify_dict.get('max_num_gaussians', -1),
         enable_tensorboard=not args.disable_tensorboard,
         log_interval=trainer_dict.get('log_interval', config_dict.get('log_interval', 10)),
         test_interval=trainer_dict.get('test_interval', 1000),
@@ -237,6 +233,7 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
 
         # Dynamic region focus weighting
         dynamic_weighting_enabled=trainer_dict.get('dynamic_weighting_enabled', False),
+        sam2_masks_dir=trainer_dict.get('sam2_masks_dir', ''),
         dynamic_boost_start_iter=trainer_dict.get('dynamic_boost_start_iter', 15000),
         dynamic_boost_end_iter=trainer_dict.get('dynamic_boost_end_iter', 20000),
         max_dynamic_boost=trainer_dict.get('max_dynamic_boost', 5.0),
@@ -244,6 +241,24 @@ def create_configs(config_dict: dict, args: argparse.Namespace) -> Tuple[
         dynamic_duration_static=trainer_dict.get('dynamic_duration_static', 0.5),
         dynamic_duration_dynamic=trainer_dict.get('dynamic_duration_dynamic', 0.1),
         dynamic_mask_threshold=trainer_dict.get('dynamic_mask_threshold', 0.5),
+
+        # Phase-based decoupled training
+        decouple_training_enabled=trainer_dict.get('decouple_training_enabled', False),
+        decouple_joint_end_iter=trainer_dict.get('decouple_joint_end_iter', 15000),
+        decouple_dynamic_end_iter=trainer_dict.get('decouple_dynamic_end_iter', 30000),
+        decouple_static_duration_threshold=trainer_dict.get('decouple_static_duration_threshold', 0.5),
+        decouple_dynamic_densify_mult=trainer_dict.get('decouple_dynamic_densify_mult', 0.5),
+        decouple_dynamic_n_split=trainer_dict.get('decouple_dynamic_n_split', 3),
+
+        # FreeTimeGS++ Affine Color Correction
+        color_correction_enabled=trainer_dict.get('color_correction_enabled', False),
+        cc_lr=trainer_dict.get('cc_lr', 0.001),
+        lambda_cc=trainer_dict.get('lambda_cc', 0.001),
+
+        # SharpTimeGS Regularization
+        lambda_lifespan=trainer_dict.get('lambda_lifespan', 0.0),
+        lambda_scale=trainer_dict.get('lambda_scale', 0.0),
+        lambda_n=trainer_dict.get('lambda_n', 0.0),
     )
     
     return data_config, model_config, optim_config, pipeline_config, trainer_config, config_dict

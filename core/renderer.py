@@ -281,8 +281,8 @@ class GaussianRenderer(nn.Module):
                 - radii: Projected radii.
                 - temporal_info: Temporal transformation info.
         """
-        if gaussians.mode != "freetime":
-            raise ValueError(f"render_temporal requires freetime mode, current mode: {gaussians.mode}")
+        if gaussians.mode not in ("freetime", "sharptime"):
+            raise ValueError(f"render_temporal requires freetime/sharptime mode, current mode: {gaussians.mode}")
         
         # 1. Time transformation
         transform_result = gaussians.get_at_time(timestamp, opacity_threshold)
@@ -434,7 +434,7 @@ class GaussianRenderer(nn.Module):
             bg_color = bg_color.cuda()
         
         # Auto-select rendering mode
-        if gaussians.mode == "freetime" and timestamp is not None:
+        if gaussians.mode in ("freetime", "sharptime") and timestamp is not None:
             return self.render_temporal(
                 gaussians, camera, bg_color, timestamp, scaling_modifier, **kwargs
             )

@@ -626,10 +626,11 @@ class FreeTimeGaussianModel(GaussianModel):
         mask = opacity_at_t.squeeze() > opacity_threshold  # [N]
         
         return {
-            'xyz_at_t': xyz_at_t,
-            'opacity_at_t': opacity_at_t,
+            'xyz_at_t':        xyz_at_t,
+            'opacity_at_t':    opacity_at_t,
             'temporal_weight': temporal_weight,
-            'mask': mask
+            'base_opacity':    base_opacity,
+            'mask':            mask,
         }
 
 

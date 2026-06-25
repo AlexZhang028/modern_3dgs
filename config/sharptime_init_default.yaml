@@ -1,0 +1,74 @@
+# SharpTimeGS Initialization Config — annotated defaults
+#
+# Usage:
+#   python tools/sharptime_init.py config/sharptime_init_default.yaml
+#
+# Copy and rename this file for each dataset, then set source_path / output_path.
+# Fields not listed here revert to the dataclass defaults.
+
+# ---------------------------------------------------------------------------
+# I/O
+# ---------------------------------------------------------------------------
+dataset:
+  source_path: ""          # [REQUIRED] SelfCap dataset root (contains extri.yml)
+  output_path: ""          # [REQUIRED] Where to write the final sharptime_init.ply
+  work_dir:    ""          # Scratch dir; default: {source_path}/.sharptime_init_work
+  start_frame:     0       # First master frame of the training window
+  end_frame:       -1      # Last master frame (-1 = infer from extracted frames)
+  extract_frames:  true    # Auto-extract frames if frames/ does not yet exist
+
+# ---------------------------------------------------------------------------
+# Step 1 — Static background (GT-pose COLMAP triangulation)
+# ---------------------------------------------------------------------------
+static:
+  reference_frame: null    # Master frame used for reference images (null = start_frame)
+  colmap_bin:      null    # Path to colmap binary (null = auto-detect from PATH)
+  skip:            false   # Set true to skip and use an existing static_init.ply
+
+# ---------------------------------------------------------------------------
+# Step 2 — Optical flow (RAFT)
+# ---------------------------------------------------------------------------
+flow:
+  model:     large         # "large" (higher quality) | "small" (faster, less VRAM)
+  iters:     20            # Recurrent update iterations (12 = fast, 32 = best quality)
+  threshold: 2.0           # Pixels/frame threshold: above → dynamic, below → static
+  max_size:  1024          # Resize long edge to this before RAFT inference, then rescale flow back.
+                           # Reduces VRAM from O((H*W)^2) to manageable; -1 disables resize.
+  skip:      false         # Set true to reuse existing flow/ directory
+
+# ---------------------------------------------------------------------------
+# Step 3 — Dynamic region segmentation (SAM2)
+# ---------------------------------------------------------------------------
+segmentation:
+  model:           large   # "large" | "base_plus" | "small" | "tiny"
+  n_prompt_points: 5       # High-flow seed points per camera fed to SAM2
+  offload_to_cpu:  false   # Offload video frames to CPU (recommended if VRAM < 12 GB)
+  skip:            false   # Set true to reuse existing masks/ directory
+
+# ---------------------------------------------------------------------------
+# Steps 4-5 — Per-frame dynamic triangulation + KNN velocity
+# ---------------------------------------------------------------------------
+dynamic:
+  n_sift_features: 2000    # Max SIFT keypoints per camera per frame
+  match_ratio:     0.75    # Lowe's ratio-test threshold (lower = stricter)
+  reproj_threshold: 4.0    # Max reprojection error (pixels) to keep a 3D point
+  min_matches:     8       # Min good matches per camera pair to triangulate
+  knn_k:           5       # KNN neighbours for cross-frame velocity matching
+  max_speed: null          # Hard cap on init velocity magnitude (world_units/s).
+                           # An IQR-based adaptive cap always applies first.
+                           # Set to e.g. 10 for meter-scale scenes (≈ max sprint speed),
+                           # or null to rely on the IQR cap alone.
+  # --- Point cloud densification (applied after triangulation, before writing PLY) ---
+  n_duplicate:            1    # Replicate each dynamic point this many times total.
+                               # 1 = disabled. Each copy gets independent XYZ jitter;
+                               # velocity and temporal anchor are inherited unchanged.
+                               # Typical range: 2–5. Training pruning removes redundant copies.
+  duplicate_jitter_sigma: 0.5  # Jitter std as a fraction of per-frame mean KNN distance.
+                               # 0.3 = tight (sub-voxel), 0.5–0.7 = gap-filling.
+  skip:            false       # Set true for static-only initialization
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+device:    cuda            # "cuda" (recommended) | "cpu" (much slower for flow/SAM2)
+overwrite: false           # true = recompute all steps even if outputs exist

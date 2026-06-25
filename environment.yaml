@@ -8,6 +8,7 @@ dependencies:
   - python=3.12
   - cuda-toolkit=12.8
   - pip
+  - colmap=3.13.0         # headless SfM/MVS; SharpTimeGS initialization
   - pip:
     - torch==2.7.0+cu128
     - torchvision==0.22.0+cu128
@@ -24,6 +25,7 @@ dependencies:
     - lpips
     - scikit-learn
     - matplotlib
+    - sam2                      # SAM2 video segmentation; dynamic-region masking
     # - diff-gaussian-rasterization  # Requires submodule
     # - simple-knn                   # Requires submodule
     # - fused-ssim

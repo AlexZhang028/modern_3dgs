@@ -1,0 +1,87 @@
+# SharpTimeGS initialization config for bar-release dataset
+
+dataset:
+  source_path: /media/data/freetimegs/data/corgi-release
+  output_path: /media/data/freetimegs/data/corgi-release/sharptime_init.ply
+  work_dir:    ""              # default: corgi-release/.sharptime_init_work
+  start_frame:    2950
+  end_frame:      3010
+  extract_frames: true     # auto-extract if frames/ not yet present
+
+static:
+  reference_frame: 2950        # use the first training frame as reference
+  colmap_bin:      null
+  skip:            false
+
+flow:
+  model:     large
+  iters:     20
+  threshold: 2.0
+  skip:      false
+
+segmentation:
+  model:           large
+  n_prompt_points: 10           # 5→10: more SAM2 seed points → more complete dynamic mask
+  offload_to_cpu:  false        # corgi has ~60 frames — fits in VRAM
+  skip:            false
+
+  # Prompt ROI: only pick positive seeds from y ∈ [0, 82%] of the image.
+  # Cameras 7/8/9 were highlighting the floor (bottom ~18%) because floor
+  # motion (shadows) exceeded subject motion from those angles.
+  prompt_y_min_frac: 0.0
+  prompt_y_max_frac: 0.82
+  # 3 negative prompts in the excluded bottom zone → SAM2 explicitly avoids floor.
+  n_negative_points: 3
+
+  # Cross-camera 3D reprompting: after the first pass, cameras whose mask
+  # covers >35% of the image or has centroid below 70% are re-segmented using
+  # a prompt derived from triangulating good cameras' mask centroids.
+  cross_cam_reproj:          true
+  mask_area_max_frac:        0.35
+  mask_centroid_y_max_frac:  0.70
+
+dynamic:
+  # --- SIFT triangulation ---
+  # NOTE: these relaxed params are designed for use WITH the dense branch.
+  # When dense.enabled=false the pipeline ignores n_duplicate/jitter and
+  # reverts to original SIFT behaviour; you should also tighten the params
+  # below back to defaults (n_sift_features:2000, match_ratio:0.75,
+  # reproj_threshold:4.0, min_matches:8) for a pure-SIFT run.
+  n_sift_features: 6000         # relaxed: 3× keypoints to feed the dense merge
+  match_ratio:     0.80         # relaxed: more matches (minor noise increase)
+  reproj_threshold: 6.0         # relaxed: keep points with higher reproject error
+  min_matches:     4            # relaxed: more camera pairs triangulate
+  knn_k:           5
+  max_speed:       10.0         # IQR cap auto-applied; hard ceiling for corgi
+
+  # --- Point cloud duplication + jitter (only applied when dense.enabled=true) ---
+  # When dense is disabled these values are automatically ignored by the
+  # pipeline and n_duplicate is forced to 1 (original SIFT output unchanged).
+  # n_duplicate=1 when dense is enabled: dense branch already provides ~5k pts/frame,
+  # so duplication adds redundant near-duplicates rather than coverage.
+  n_duplicate:            1     # copies per SIFT point; 1 = off
+  duplicate_jitter_sigma: 0.4   # jitter = fraction × mean KNN distance
+
+  skip:            false
+
+# ---------------------------------------------------------------------------
+# Dense MVS for dynamic region (Step 4b)
+# Supplements SIFT to recover points on smooth clothing / plain skin areas
+# that have no detectable keypoints.
+# ---------------------------------------------------------------------------
+dense:
+  enabled:            true
+  merge_sparse:       true    # keep SIFT points alongside dense cloud
+  block_size:         11      # SGBM window; 11 = good detail/noise balance
+  uniqueness_ratio:   10
+  speckle_window_size: 100
+  speckle_range:      2
+  min_depth:          0.3     # person is typically ≥ 0.5 m from any camera
+  max_depth:          8.0     # corgi scene radius
+  min_baseline:       0.15    # skip very close camera pairs
+  max_baseline:       2.0     # skip opposite-side cameras (10+ m); their disparity >> image width → SGBM overflow
+  voxel_size:         0.015   # 1.5 cm cells → ~human-body-detail scale
+  max_image_size:     960     # 4K (3840×2160) → 960×540; avoids SGBM OOM
+
+device:    cuda
+overwrite: false

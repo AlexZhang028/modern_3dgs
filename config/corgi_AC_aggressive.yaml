@@ -1,10 +1,10 @@
 data:
-  cache_images: true
+  cache_images: false
   end_frame: 3010
   eval: false
   images: images
   init_point_cloud_path: '/media/data/freetimegs/data/corgi-release/sharptime_init.ply'
-  model_path: /media/data/freetimegs/res/corgi/02_sharptime_init
+  model_path: /media/data/freetimegs/res/corgi/AC_aggressive
   normalized_t: false
   num_workers: 0
   resolution: 4
@@ -16,30 +16,41 @@ data:
   white_background: false
 
 # ---------------------------------------------------------------------------
-# Training schedule (50k total)
+# Combined & Aggressive: A + C
 #
-#   Phase 1  [ 0 –  10k] Joint: all Gaussians optimize freely, geometry formed
-#   Phase 2  [10k –  25k] Dynamic focus: static grads zeroed + dynamic grad
-#                          boosted (×2 for densification), SAM2-based loss boost
-#   Refine   [25k –  50k] Joint: no densification, no gradient routing,
-#                          SAM2 boost remains active (appearance refinement)
+#   Training schedule (50k total)
+#   Phase 1  [ 0 –  10k] Joint: geometry formation
+#   Phase 2  [10k –  25k] Dynamic focus: static grads zeroed, dynamic grad
+#                          boosted, SAM2 loss boost active
+#   Refine   [25k –  50k] Joint: appearance refinement, no densification
+#
+# Changes from baseline (corgi_edge_optim):
+#
+#   [A] Dynamic splits — primary driver of dynamic PSNR gain
+#       decouple_dynamic_n_split:      3    →  5     (A was 4; push further)
+#       decouple_dynamic_densify_mult: 0.5  →  0.33  (A was 0.4; ~3× grad boost)
+#
+#   [C] SAM2 loss boost — focuses loss energy on dynamic regions longer
+#       max_dynamic_boost:             4.0  →  8.0   (C was 6.0; push further)
+#       dynamic_boost_end_iter:      15000  →  22000 (C was 20000; extend ramp)
+#       dynamic_boost_curve_power:     3.0  →  1.5   (C was 2.0; flatter curve
+#                                                     = boost stays elevated longer)
 # ---------------------------------------------------------------------------
 
 iterations: 50000
 
 densify:
   densify_from_iter: 500
-  densify_until_iter: 25000         # Cover full Phase 2 (was 15k)
+  densify_until_iter: 25000
   densify_interval: 100
   densify_grad_threshold: 0.0001
   densify_grad_threshold_final: 0.0001
-  opacity_reset_until_iter: 12000   # Shorter reset window; stable by Phase 2
+  opacity_reset_until_iter: 12000
   prune_opacity_threshold: 0.005
   prune_from_iter: 500
   percent_dense: 0.01
   N_split: 2
   max_num_gaussians: 4500000      # hard cap: skip densify above this to prevent OOM
-  # Velocity-conditioned scale restriction
   velocity_normalizer: 2.0
   scale_shrink_multiplier: 2.0
   min_dynamic_scale_denominator: 1e-6
@@ -75,28 +86,25 @@ trainer:
   opacity_reset_until_iter: 12000
 
   # --- Phase schedule -------------------------------------------------------
-  # Phase 1: joint (0-10k)
-  # Phase 2: dynamic focus (10k-25k)  ← static grads zeroed, dynamic grad boosted
-  # Refine:  joint (25k-50k)          ← no routing, no densification
   decouple_training_enabled: true
   decouple_joint_end_iter: 10000
   decouple_dynamic_end_iter: 25000
   decouple_static_duration_threshold: 0.5
-  # Per-Gaussian dynamic densification (A): boost dynamic grad accum by 1/0.5 = 2×
-  # so dynamic Gaussians hit the base threshold at half the gradient magnitude.
-  decouple_dynamic_densify_mult: 0.5
-  # Moderate N_split for dynamic Gaussians (was 5 — too aggressive)
-  decouple_dynamic_n_split: 3
+  # [A] 3× gradient boost for dynamic Gaussians (baseline: 2×)
+  decouple_dynamic_densify_mult: 0.33
+  # [A] 5 children per split event on dynamic Gaussians (baseline: 3)
+  decouple_dynamic_n_split: 5
 
-  # --- SAM2-based dynamic loss boost (B) ------------------------------------
-  # Replace the old model-rendered dynamic weight map with GT SAM2 masks.
-  # Set sam2_masks_dir to the masks/ directory from sharptime_init pipeline.
+  # --- SAM2-based dynamic loss boost ----------------------------------------
   dynamic_weighting_enabled: true
   sam2_masks_dir: '/media/data/freetimegs/data/corgi-release/masks'
-  dynamic_boost_start_iter: 10000   # Starts with Phase 2
-  dynamic_boost_end_iter: 15000     # Ramps from 0 → max over 5k iters
-  max_dynamic_boost: 4.0            # Was 5.0; SAM2 masks are binary so boost is sharp
-  dynamic_boost_curve_power: 3.0
+  dynamic_boost_start_iter: 10000
+  # [C] Ramp from 10k → 22k (baseline: 10k → 15k)
+  dynamic_boost_end_iter: 22000
+  # [C] Peak boost 8× (baseline: 4×)
+  max_dynamic_boost: 8.0
+  # [C] Flatter sigmoid curve — boost stays near peak for longer (baseline: 3.0)
+  dynamic_boost_curve_power: 1.5
 
   # --- SharpTimeGS regularization -------------------------------------------
   lambda_scale: 0.01
@@ -109,10 +117,6 @@ trainer:
   lambda_cc: 0.001
 
   # --- Motion blur penalty --------------------------------------------------
-  # World coordinates are metric (camera |T| ≈ 0.6–6 m).
-  # A running corgi moves at ~5 m/s; threshold=2.0 allows slow/static
-  # Gaussians to be unpenalized while still discouraging spurious high-speed
-  # artifacts from noisy KNN velocity init.
   motion_blur_start_iter: 15000
   lambda_motion_blur: 0.05
   motion_blur_speed_threshold: 2.0

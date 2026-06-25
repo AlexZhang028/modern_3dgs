@@ -1,13 +1,10 @@
 data:
   cache_images: false
-  data_device: cuda
   eval: false
   images: images
   init_point_cloud_path: ''
-  lazy_loading: true
   model_path: /mnt/hdd/freetime/bar-release
   num_workers: 0
-  pin_memory: true
   resolution: 4
   source_path: /mnt/hdd/selfcap/bar-release
   start_frame: 3190
